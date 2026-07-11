@@ -1,0 +1,26 @@
+# Go build output
+/server
+*.exe
+
+# Local environment / secrets
+.env
+*.env
+
+# Frontend (client/, added in Phase 7)
+node_modules/
+client/dist/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Private planning / teaching docs (not part of the shipped project)
+CLAUDE.local.md
+PROJECT3_BUILD_PLAN.md
+UI_SPEC.md
+INFER-~1.HTM
+infer-gateway-ui-mock.html
+
+# Unpublished content drafts (LinkedIn posts, etc.)
+content/
