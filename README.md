@@ -16,6 +16,22 @@ those features visible on screen.
 >   -d '{"prompt":"Explain a token bucket rate limiter in two sentences."}'
 > ```
 
+## Project status
+
+Built local-first, phase by phase. This README describes the full target system; the
+sections below marked *(planned)* land in later phases.
+
+**Done (Phase 1):** HTTP server on `net/http` (Go 1.22 routing), `GET /health` and
+`GET /ready`, one structured `slog` JSON line per request (`request_id`, `method`,
+`path`, `status`, `latency_ms`), and CORS with preflight handling. Run it with
+`go run ./cmd/server`.
+
+**In progress:** `POST /v1/chat` non-streaming Bedrock call + cost metering (Phase 2),
+API-key auth (Phase 3), SSE streaming (Phase 4), per-key rate limiting (Phase 5),
+retries with backoff + jitter and tests (Phase 6), the React/TS client (Phase 7), and
+AWS deploy via Docker + Terraform + ECS (Phases 8-9). The `docker run` and `/v1/chat`
+quickstart commands below are the target once those phases land.
+
 ## The problem
 
 Raw Bedrock gives you a model endpoint and nothing else. It has no notion of *your* API keys, no
@@ -52,7 +68,7 @@ tested with a fake and models swapped without touching handler code.
 - Retries transient Bedrock failures with exponential backoff and jitter, and only transient ones, while
   respecting client cancellation.
 - Meters token usage and cost per request and logs one structured JSON line per request.
-- `GET /healthz` and `GET /readyz` for liveness and readiness.
+- `GET /health` and `GET /ready` for liveness and readiness.
 - A React and TypeScript client that streams the response live, cancels an in-flight request with a Stop
   button, and surfaces the auth, rate-limit, and cost states.
 
