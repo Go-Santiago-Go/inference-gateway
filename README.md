@@ -23,14 +23,30 @@ sections below marked *(planned)* land in later phases.
 
 **Done (Phase 1):** HTTP server on `net/http` (Go 1.22 routing), `GET /health` and
 `GET /ready`, one structured `slog` JSON line per request (`request_id`, `method`,
-`path`, `status`, `latency_ms`), and CORS with preflight handling. Run it with
-`go run ./cmd/server`.
+`path`, `status`, `latency_ms`), and CORS with preflight handling.
 
-**In progress:** `POST /v1/chat` non-streaming Bedrock call + cost metering (Phase 2),
-API-key auth (Phase 3), SSE streaming (Phase 4), per-key rate limiting (Phase 5),
-retries with backoff + jitter and tests (Phase 6), the React/TS client (Phase 7), and
-AWS deploy via Docker + Terraform + ECS (Phases 8-9). The `docker run` and `/v1/chat`
-quickstart commands below are the target once those phases land.
+**Done (Phase 2):** `POST /v1/chat` calls AWS Bedrock (Converse API) for a non-streaming
+completion, meters token usage into a per-request `cost_usd`, and logs it, all behind a
+`Generator` interface (fake in tests, real client in `main`). The request context threads
+into the SDK call, so a client disconnect cancels the upstream request. Walkthrough and
+interview notes: [`content/phase-2/`](./content/phase-2/README.md). Run it locally:
+
+```bash
+export AWS_REGION=us-east-1                    # region where Bedrock model access is enabled
+export BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0  # optional; this is the default
+go run ./cmd/server
+curl -s -X POST http://localhost:8080/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"say hello in five words"}'
+# => {"text":"...","tokens_in":13,"tokens_out":13,"cost_usd":0.000078,"latency_ms":842}
+```
+
+No API key is required yet (auth lands in Phase 3), so the `X-API-Key` header and the
+`docker run` quickstart further below are still the *target* shape.
+
+**In progress:** API-key auth (Phase 3), SSE streaming (Phase 4), per-key rate limiting
+(Phase 5), retries with backoff + jitter and tests (Phase 6), the React/TS client
+(Phase 7), and AWS deploy via Docker + Terraform + ECS (Phases 8-9).
 
 ## The problem
 
