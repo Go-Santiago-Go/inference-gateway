@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/Go-Santiago-Go/inference-gateway/internal/bedrock"
 	"github.com/Go-Santiago-Go/inference-gateway/internal/handler"
@@ -32,6 +33,16 @@ func main() {
 		modelID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 	}
 
+	// API keys are config, not code: a comma-separated API_KEYS list parsed once
+	// into a set the Auth middleware checks each request against.
+	apiKeys := parseAPIKeys(os.Getenv("API_KEYS"))
+	// Fail loud on an empty set: a gateway that authenticates every request but
+	// holds no valid keys would 401 all traffic while still reporting healthy,
+	// which reads as a silent outage. Refuse to boot instead.
+	if len(apiKeys) == 0 {
+		log.Fatal("no API keys configured: set API_KEYS to a comma-separated list")
+	}
+
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status": "ok"}`))
@@ -50,8 +61,9 @@ func main() {
 		log.Fatalf("bedrock client: %v", err)
 	}
 
+	auth := middleware.Auth(apiKeys)
 	chat := handler.New(gen, modelID)
-	mux.HandleFunc("POST /v1/chat", chat.Chat)
+	mux.Handle("POST /v1/chat", auth(http.HandlerFunc(chat.Chat)))
 
 	cors := middleware.CORS("http://localhost:5173")
 
@@ -63,4 +75,17 @@ func main() {
 
 	log.Println("listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", root))
+}
+
+// parseAPIKeys turns a comma-separated API_KEYS value into a set of valid keys.
+// Surrounding whitespace is trimmed and blank entries are skipped, so a value
+// like "a, b," yields the set {a, b}.
+func parseAPIKeys(raw string) map[string]bool {
+	keys := make(map[string]bool)
+	for k := range strings.SplitSeq(raw, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			keys[k] = true
+		}
+	}
+	return keys
 }

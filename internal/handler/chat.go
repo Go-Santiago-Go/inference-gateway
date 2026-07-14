@@ -11,6 +11,7 @@ import (
 
 	"github.com/Go-Santiago-Go/inference-gateway/internal/bedrock"
 	"github.com/Go-Santiago-Go/inference-gateway/internal/meter"
+	"github.com/Go-Santiago-Go/inference-gateway/internal/middleware"
 )
 
 // Handler serves the chat endpoint. It depends on the bedrock.Generator
@@ -53,6 +54,8 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	key := middleware.KeyFromContext(r.Context())
+
 	start := time.Now()
 	comp, err := h.gen.Generate(r.Context(), req.Prompt) // cancellation propagates
 	if err != nil {
@@ -64,6 +67,7 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 	cost := meter.Cost(h.model, comp.TokensIn, comp.TokensOut)
 
 	slog.Info("generation",
+		"key", key,
 		"model", h.model,
 		"tokens_in", comp.TokensIn,
 		"tokens_out", comp.TokensOut,

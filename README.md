@@ -34,19 +34,23 @@ interview notes: [`content/phase-2/`](./content/phase-2/README.md). Run it local
 ```bash
 export AWS_REGION=us-east-1                    # region where Bedrock model access is enabled
 export BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0  # optional; this is the default
+export API_KEYS=testkey                         # comma-separated valid keys; the server refuses to boot without at least one
 go run ./cmd/server
 curl -s -X POST http://localhost:8080/v1/chat \
-  -H "Content-Type: application/json" \
+  -H "X-API-Key: testkey" -H "Content-Type: application/json" \
   -d '{"prompt":"say hello in five words"}'
 # => {"text":"...","tokens_in":13,"tokens_out":13,"cost_usd":0.000078,"latency_ms":842}
 ```
 
-No API key is required yet (auth lands in Phase 3), so the `X-API-Key` header and the
-`docker run` quickstart further below are still the *target* shape.
+**Done (Phase 3):** every request to `POST /v1/chat` is authenticated by the `X-API-Key`
+header against a set loaded from `API_KEYS`. A missing or unknown key is rejected with
+`401` in middleware, before any Bedrock call; a valid key is attached to the request
+context and appears in the per-request log line, so cost is attributable per caller. Auth
+wraps only the chat route, so the `/health` and `/ready` probes stay open.
 
-**In progress:** API-key auth (Phase 3), SSE streaming (Phase 4), per-key rate limiting
-(Phase 5), retries with backoff + jitter and tests (Phase 6), the React/TS client
-(Phase 7), and AWS deploy via Docker + Terraform + ECS (Phases 8-9).
+**In progress:** SSE streaming (Phase 4), per-key rate limiting (Phase 5), retries with
+backoff + jitter and tests (Phase 6), the React/TS client (Phase 7), and AWS deploy via
+Docker + Terraform + ECS (Phases 8-9).
 
 ## The problem
 
