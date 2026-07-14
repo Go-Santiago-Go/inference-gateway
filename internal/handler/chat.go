@@ -35,9 +35,11 @@ type chatRequest struct {
 }
 
 // chatResponse is the successful JSON response: the completion text plus the
-// per-request usage the client's metrics footer renders.
+// per-request usage the client's metrics footer renders. Text is omitempty so
+// the streaming path can reuse this struct for its final usage frame, which
+// carries only the metered fields and no text.
 type chatResponse struct {
-	Text      string  `json:"text"`
+	Text      string  `json:"text,omitempty"`
 	TokensIn  int     `json:"tokens_in"`
 	TokensOut int     `json:"tokens_out"`
 	CostUSD   float64 `json:"cost_usd"`

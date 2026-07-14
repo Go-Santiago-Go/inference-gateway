@@ -48,9 +48,33 @@ header against a set loaded from `API_KEYS`. A missing or unknown key is rejecte
 context and appears in the per-request log line, so cost is attributable per caller. Auth
 wraps only the chat route, so the `/health` and `/ready` probes stay open.
 
-**In progress:** SSE streaming (Phase 4), per-key rate limiting (Phase 5), retries with
-backoff + jitter and tests (Phase 6), the React/TS client (Phase 7), and AWS deploy via
-Docker + Terraform + ECS (Phases 8-9).
+**Done (Phase 4):** `POST /v1/chat` now streams the completion token by token over
+Server-Sent Events. Bedrock's `ConverseStream` events are relayed by a producer goroutine
+onto a channel, and the handler writes each as a `data:` frame flushed immediately with
+`http.Flusher`, then emits a final `event: usage` frame carrying the same `tokens_in`,
+`tokens_out`, `cost_usd`, and `latency_ms` fields it logs. The request context threads into
+the stream, so a client disconnect cancels the upstream Bedrock call instead of paying for
+unread tokens. Tested end to end against a fake `Generator` with no AWS. Walkthrough and
+interview notes: [`content/phase-4/`](./content/phase-4/phase-4-postflight-walkthrough.md).
+Watch it stream:
+
+```bash
+export AWS_REGION=us-east-1
+export API_KEYS=testkey
+go run ./cmd/server
+curl -N -X POST http://localhost:8080/v1/chat \
+  -H "X-API-Key: testkey" -H "Content-Type: application/json" \
+  -d '{"prompt":"say hello in five words"}'
+# => data: Hello,
+#    data:  how are you today
+#    data: ?
+#    event: usage
+#    data: {"tokens_in":14,"tokens_out":10,"cost_usd":0.000064,"latency_ms":1667}
+```
+
+**In progress:** per-key rate limiting (Phase 5), retries with backoff + jitter and tests
+(Phase 6), the React/TS client (Phase 7), and AWS deploy via Docker + Terraform + ECS
+(Phases 8-9).
 
 ## The problem
 

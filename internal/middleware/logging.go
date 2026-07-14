@@ -22,6 +22,15 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// Flush forwards to the underlying ResponseWriter's Flush so wrapping it here
+// does not disable SSE streaming downstream. Without it the wrapper would hide
+// the Flusher the real writer implements, and the stream handler would 500.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // Logging wraps next and emits one structured log line per request, recording
 // the request method, path, and the latency of the wrapped handler.
 func Logging(next http.Handler) http.Handler {

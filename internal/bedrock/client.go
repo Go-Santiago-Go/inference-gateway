@@ -86,3 +86,82 @@ func (c *Client) Generate(ctx context.Context, prompt string) (Completion, error
 		TokensOut: tokensOut,
 	}, nil
 }
+
+// GenerateStream calls Bedrock's ConverseStream and relays the model's output
+// over a channel as it is generated. It returns immediately; a background
+// goroutine pumps text chunks into the channel and sends a final chunk carrying
+// the token counts before closing. The channel closes when the model finishes,
+// ctx is cancelled, or the stream errors, so a client disconnect stops the
+// upstream call instead of paying for tokens no one will read.
+func (c *Client) GenerateStream(ctx context.Context, prompt string) (<-chan Chunk, error) {
+	// Starting the stream can fail synchronously (bad model ID, auth); surface
+	// that as an ordinary error before any goroutine exists so the handler can
+	// still set a response status. The Messages shape matches Generate exactly.
+	out, err := c.api.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
+		ModelId: aws.String(c.modelID),
+		Messages: []types.Message{
+			{
+				Role: types.ConversationRoleUser,
+				Content: []types.ContentBlock{
+					&types.ContentBlockMemberText{Value: prompt},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Unbuffered: each send blocks until the handler receives, so the producer
+	// cannot race ahead of the consumer. This backpressure is what keeps the
+	// relay honest and ties chunk delivery to the handler's flush cadence.
+	ch := make(chan Chunk)
+
+	// Read the Bedrock event stream in the background and return ch immediately,
+	// so the handler starts relaying and flushing chunks while the model is
+	// still generating. Draining the stream here first would collect every token
+	// before returning and defeat streaming.
+	go func() {
+		stream := out.GetStream()
+		// LIFO: close(ch) runs first to end the handler's range, then the SDK
+		// stream is released. Both are deferred so they fire on every exit path
+		// (normal end, cancellation, or a mid-stream error), never leaking.
+		defer stream.Close()
+		defer close(ch)
+
+		for event := range stream.Events() {
+			// Each event is a union; we care about incremental text deltas and
+			// the terminal metadata event carrying the token usage.
+			switch e := event.(type) {
+			case *types.ConverseStreamOutputMemberContentBlockDelta:
+				text, ok := e.Value.Delta.(*types.ContentBlockDeltaMemberText)
+				if !ok {
+					continue // non-text delta (tool use, etc.); nothing to relay
+				}
+				// select, not a bare send: if the client has disconnected the
+				// handler is no longer receiving, and on an unbuffered channel a
+				// plain send would block forever. ctx.Done() lets us abandon the
+				// stream instead of leaking this goroutine.
+				select {
+				case ch <- Chunk{Text: text.Value}:
+				case <-ctx.Done():
+					return
+				}
+			case *types.ConverseStreamOutputMemberMetadata:
+				// The final usage event: emit one chunk with token counts and no
+				// text, which the handler turns into the trailing usage frame.
+				if u := e.Value.Usage; u != nil {
+					select {
+					case ch <- Chunk{
+						TokensIn:  int(aws.ToInt32(u.InputTokens)),
+						TokensOut: int(aws.ToInt32(u.OutputTokens)),
+					}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}
+	}()
+	return ch, nil
+}

@@ -63,7 +63,7 @@ func main() {
 
 	auth := middleware.Auth(apiKeys)
 	chat := handler.New(gen, modelID)
-	mux.Handle("POST /v1/chat", auth(http.HandlerFunc(chat.Chat)))
+	mux.Handle("POST /v1/chat", auth(http.HandlerFunc(chat.ChatStream)))
 
 	cors := middleware.CORS("http://localhost:5173")
 
