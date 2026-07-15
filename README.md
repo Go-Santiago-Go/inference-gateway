@@ -1,91 +1,33 @@
 # infer-gateway
 
-![ci](https://github.com/Go-Santiago-Go/infer-gateway/actions/workflows/ci.yml/badge.svg)
+[![ci](https://github.com/Go-Santiago-Go/inference-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Go-Santiago-Go/inference-gateway/actions/workflows/ci.yml)
 
-A containerized Go service that sits in front of AWS Bedrock and adds the production operations layer
-around LLM inference: streaming responses, per-key API auth, per-key rate limiting, retries with
-backoff, and per-request token and cost accounting, all observable through structured logs. It ships
-with a React and TypeScript client that streams from the gateway in the browser and makes every one of
-those features visible on screen.
+**A production-shaped inference gateway in Go that sits in front of AWS Bedrock.** It adds the
+operations layer that raw Bedrock lacks: Server-Sent Events token streaming, per-key API-key auth,
+per-key rate limiting, retries with backoff and jitter, and per-request token and cost accounting,
+all observable through structured `slog` logs.
 
-> Live gateway: `<https://your-live-url>` · Live client: `<https://your-client-url>`
->
-> ```bash
-> curl -N -X POST https://your-live-url/v1/chat \
->   -H "X-API-Key: <key>" -H "Content-Type: application/json" \
->   -d '{"prompt":"Explain a token bucket rate limiter in two sentences."}'
-> ```
+Bedrock is called behind a `Generator` interface and every cross-cutting concern lives in its own
+middleware, so the pipeline is unit tested with zero cloud access and the handler stays a thin piece
+of orchestration. A React and TypeScript client streams from the gateway in the browser and makes
+each of those features visible on screen. Built to be consumed by a human, a browser, or an agent.
 
-## Project status
+One streaming endpoint, plus probes:
 
-Built local-first, phase by phase. This README describes the full target system; the
-sections below marked *(planned)* land in later phases.
+- `POST /v1/chat` streams a Bedrock completion back token by token over SSE, ending with a `usage`
+  event that carries the request's token counts, cost, and latency. The request is authenticated by
+  API key, rate limited per key, and retried on transient failures.
+- `GET /health` and `GET /ready` for liveness and readiness.
 
-**Done (Phase 1):** HTTP server on `net/http` (Go 1.22 routing), `GET /health` and
-`GET /ready`, one structured `slog` JSON line per request (`request_id`, `method`,
-`path`, `status`, `latency_ms`), and CORS with preflight handling.
-
-**Done (Phase 2):** `POST /v1/chat` calls AWS Bedrock (Converse API) for a non-streaming
-completion, meters token usage into a per-request `cost_usd`, and logs it, all behind a
-`Generator` interface (fake in tests, real client in `main`). The request context threads
-into the SDK call, so a client disconnect cancels the upstream request. Walkthrough and
-interview notes: [`content/phase-2/`](./content/phase-2/README.md). Run it locally:
-
-```bash
-export AWS_REGION=us-east-1                    # region where Bedrock model access is enabled
-export BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0  # optional; this is the default
-export API_KEYS=testkey                         # comma-separated valid keys; the server refuses to boot without at least one
-go run ./cmd/server
-curl -s -X POST http://localhost:8080/v1/chat \
-  -H "X-API-Key: testkey" -H "Content-Type: application/json" \
-  -d '{"prompt":"say hello in five words"}'
-# => {"text":"...","tokens_in":13,"tokens_out":13,"cost_usd":0.000078,"latency_ms":842}
-```
-
-**Done (Phase 3):** every request to `POST /v1/chat` is authenticated by the `X-API-Key`
-header against a set loaded from `API_KEYS`. A missing or unknown key is rejected with
-`401` in middleware, before any Bedrock call; a valid key is attached to the request
-context and appears in the per-request log line, so cost is attributable per caller. Auth
-wraps only the chat route, so the `/health` and `/ready` probes stay open.
-
-**Done (Phase 4):** `POST /v1/chat` now streams the completion token by token over
-Server-Sent Events. Bedrock's `ConverseStream` events are relayed by a producer goroutine
-onto a channel, and the handler writes each as a `data:` frame flushed immediately with
-`http.Flusher`, then emits a final `event: usage` frame carrying the same `tokens_in`,
-`tokens_out`, `cost_usd`, and `latency_ms` fields it logs. The request context threads into
-the stream, so a client disconnect cancels the upstream Bedrock call instead of paying for
-unread tokens. Tested end to end against a fake `Generator` with no AWS. Walkthrough and
-interview notes: [`content/phase-4/`](./content/phase-4/phase-4-postflight-walkthrough.md).
-Watch it stream:
-
-```bash
-export AWS_REGION=us-east-1
-export API_KEYS=testkey
-go run ./cmd/server
-curl -N -X POST http://localhost:8080/v1/chat \
-  -H "X-API-Key: testkey" -H "Content-Type: application/json" \
-  -d '{"prompt":"say hello in five words"}'
-# => data: Hello,
-#    data:  how are you today
-#    data: ?
-#    event: usage
-#    data: {"tokens_in":14,"tokens_out":10,"cost_usd":0.000064,"latency_ms":1667}
-```
-
-**In progress:** per-key rate limiting (Phase 5), retries with backoff + jitter and tests
-(Phase 6), the React/TS client (Phase 7), and AWS deploy via Docker + Terraform + ECS
-(Phases 8-9).
-
-## The problem
-
-Raw Bedrock gives you a model endpoint and nothing else. It has no notion of *your* API keys, no
-per-caller rate limiting, no cost attribution, and no request-level observability. Put anything real in
-front of it and you need that operations layer. `infer-gateway` is that layer: a thin, fast Go service
-that authenticates callers, protects the backend, retries the failures worth retrying, meters what each
-request costs, and streams the answer back token by token. The web client proves it end to end in a
-browser.
+> **Project status:** built local-first, phase by phase. Phases 1 to 5 are done and verified end to
+> end (server, non-streaming Converse, per-key auth, SSE streaming, per-key rate limiting). Retries
+> (Phase 6) are the MVP cut line; the client and the AWS deploy follow. This README describes the full
+> target system, and the [Status](#status) section marks exactly what runs today. Nothing is deployed
+> yet, so there is no always-on URL to bill overnight.
 
 ## Architecture
+
+The service, end to end:
 
 ```mermaid
 flowchart LR
@@ -97,106 +39,282 @@ flowchart LR
     G -.->|"slog JSON: request_id, key, tokens, cost, ms"| L[("CloudWatch")]
 ```
 
-Every request flows through a chain of composable middleware. Cross-cutting concerns (CORS, auth, rate
-limiting, logging, metering) each wrap the next, so the handler stays a thin piece of orchestration and
-each concern is testable in isolation. The Bedrock client sits behind a Go interface, so handlers can be
-tested with a fake and models swapped without touching handler code.
+Every request flows through a chain of composable middleware. Cross-cutting concerns (CORS, auth,
+rate limiting, logging, metering) each wrap the next, so the handler stays a thin piece of
+orchestration and each concern is testable in isolation. The Bedrock client sits behind a Go
+interface, so handlers can be tested with a fake and models swapped without touching handler code.
 
-## What it does
+**Streaming without burning tokens.** `POST /v1/chat` relays Bedrock `ConverseStream` events onto a
+channel, and the handler writes each as a `data:` frame flushed immediately with `http.Flusher`, then
+emits a final `event: usage` frame. The request context threads from the handler through the
+`Generator` into the SDK call, so a client disconnect (or the client's Stop button) cancels the
+in-flight Bedrock call and the retry loop instead of paying for tokens nobody reads.
 
-- `POST /v1/chat` streams a Bedrock completion back token by token over Server-Sent Events, ending with
-  a `usage` event carrying the request's token counts, cost, and latency.
-- Authenticates every request by API key and rejects unknown keys with `401`.
-- Rate-limits per key with a token bucket, returning `429` and a `Retry-After` header when a key exceeds
-  its rate.
-- Retries transient Bedrock failures with exponential backoff and jitter, and only transient ones, while
-  respecting client cancellation.
-- Meters token usage and cost per request and logs one structured JSON line per request.
-- `GET /health` and `GET /ready` for liveness and readiness.
-- A React and TypeScript client that streams the response live, cancels an in-flight request with a Stop
-  button, and surfaces the auth, rate-limit, and cost states.
+### Deployment (AWS) · planned
 
-## Quickstart
+The container runs on **Amazon ECS Express Mode on Fargate**: from an image plus a few IAM roles,
+Express Mode provisions the Fargate service, an internet-facing load balancer with TLS, health
+checks, and the security-group wiring between the load balancer and the task, and hands back a public
+`*.ecs.<region>.on.aws` URL. There is no database and no data tier: rate-limit state lives in the
+task's memory, so the request path is just the load balancer and the app.
 
-Prerequisites: Go 1.22+, Node 20+, Docker, and Bedrock model access enabled for a Converse-stream model
-in your region.
+```mermaid
+flowchart TB
+    user(["Client · Browser · Agent · Internet"])
 
-Run the gateway:
+    subgraph vpc["Amazon VPC · Region us-east-1"]
+        direction TB
+        igw{{"Internet Gateway"}}
+
+        subgraph web["🌐  PUBLIC SUBNETS"]
+            direction TB
+            alb(["Application Load Balancer<br/>internet-facing · TLS<br/>idle timeout raised for SSE"])
+            task["ECS Fargate task<br/>infer-gateway :8080<br/>single task · in-memory rate limits"]
+        end
+    end
+
+    subgraph svc["Regional AWS services"]
+        direction LR
+        bedrock["Amazon Bedrock<br/>Converse · ConverseStream"]
+        ecr[("Amazon ECR")]
+        cw["CloudWatch Logs<br/>slog JSON per request"]
+    end
+
+    user ==>|"HTTPS 443"| igw
+    igw ==>|"443"| alb
+    alb ==>|"8080 · SSE"| task
+    task -.->|"ConverseStream"| bedrock
+    task -.->|"pull image"| ecr
+    task -.->|"structured logs"| cw
+
+    classDef ext fill:#232f3e,stroke:#ff9900,color:#ffffff;
+    classDef net fill:#e7f0fb,stroke:#1a73e8,color:#0b3d91;
+    classDef compute fill:#fdecd2,stroke:#ff9900,color:#7a4f01;
+    class bedrock,ecr,cw ext;
+    class igw,alb net;
+    class task compute;
+
+    style vpc fill:#f6f2fb,stroke:#7d3ac1,stroke-width:2px,color:#4a1d7a;
+    style web fill:#eaf6ea,stroke:#2e7d32,stroke-width:3px,color:#1b5e20;
+    style svc fill:#fbfbfb,stroke:#bbbbbb,stroke-dasharray:2 2,color:#444444;
+
+    linkStyle 0,1,2 stroke:#ff9900,stroke-width:2px;
+```
+
+The orange path traces a request in: **Client → Internet Gateway → Application Load Balancer → ECS
+task**. The dashed lines are the task's outbound calls: Bedrock for inference, ECR for the image at
+launch, and CloudWatch for the structured logs. A multi-stage Docker build ships a distroless binary
+for a small image and attack surface, and GitHub Actions builds and pushes it to ECR over GitHub OIDC
+(keyless CI/CD).
+
+**Two honest constraints.** First, the ALB idle timeout defaults to 60 seconds and would cut a
+long-lived SSE stream mid-answer, so it must be raised before relying on it. Second, the token-bucket
+limiters live in the task's memory, which is only globally correct while a **single task** serves
+traffic; scaling out to several tasks would split each key's budget across them, so multi-task
+correctness needs shared state in Redis and is a stretch item, not the MVP. This all lands in Phases
+8 to 9; the [Status](#status) section is the source of truth for what is actually built.
+
+## Design decisions
+
+Every choice below optimizes for one constraint: the simplest component that satisfies the
+requirement, reaching for managed or heavyweight infrastructure only where the workload genuinely
+demands it. The decisions that are not load-bearing sit behind interfaces, so they can change later
+without disturbing the core.
+
+| Decision | Choice | Why | Also considered |
+|---|---|---|---|
+| Token streaming | SSE over plain HTTP | Flow is one-directional server to client; plain HTTP works through ALBs and `curl` with no handshake | WebSockets |
+| Client stream read | `fetch` + `ReadableStream` | `EventSource` only issues `GET`; `/v1/chat` is a `POST` with a JSON body | `EventSource` |
+| Rate limiting | In-memory token bucket per key | A single task makes per-key limiters correct and defensible, with zero extra infrastructure | Redis, leaky bucket, sliding window |
+| Rate-limit state | In-process (`sync.Map` of limiters) | No database in the MVP; the multi-task answer is Redis, and it is a stretch item | Redis-backed shared state |
+| Retries | Backoff + jitter, transient only | Retrying a `4xx` just wastes calls; jitter avoids a thundering herd on the backend | Retry everything, fixed backoff |
+| Bedrock access | Behind a `Generator` interface | Handlers test against a fake with no AWS, and models swap without touching handler code | Call the SDK directly |
+| Cross-cutting concerns | Middleware chain | Auth, limits, metering, and logging each stay testable in isolation and the handler stays thin | Logic inside handlers |
+| Compute | ECS Express Mode on Fargate | Managed networking, load balancing, and scaling from an image; App Runner is closed to new customers | Full ECS Fargate |
+
+The pattern under all of it is **dependency inversion at the boundaries**: the request path depends on
+a `Generator` interface, and the concrete Bedrock client is plugged in at `main`. That is what lets
+the whole pipeline be tested with a fake generator and no cloud, and lets the model or provider be
+swapped without touching handler code.
+
+## Status
+
+Built local-first, phase by phase. Boxes below are checked only where the work is done and verified
+end to end.
+
+- [x] HTTP server on `net/http` (Go 1.22 routing), `GET /health` and `GET /ready`, one structured
+  `slog` JSON line per request, and CORS with preflight handling (Phase 1)
+- [x] `POST /v1/chat` non-streaming Bedrock Converse completion, metered into a per-request
+  `cost_usd`, all behind a `Generator` interface with a fake in tests (Phase 2)
+- [x] Per-key API-key auth in middleware: unknown or missing `X-API-Key` rejected with `401` before
+  any Bedrock call; the valid key threads into the log line (Phase 3)
+- [x] SSE token streaming with a final `event: usage` frame; client disconnect cancels the upstream
+  Bedrock call (Phase 4)
+- [x] Per-key rate limiting with a token bucket: `429` plus a `Retry-After` header, verified under
+  concurrent load (Phase 5)
+- [ ] Retries with exponential backoff and jitter, transient errors only, with tests in CI (Phase 6,
+  the MVP cut line)
+- [ ] React and TypeScript client that streams live and cancels with a Stop button (Phase 7)
+- [ ] Containerized with a distroless image, Terraform, and CI/CD to ECR, deployed on ECS Express
+  Mode with a live public URL (Phases 8 to 9)
+
+## Stack
+
+- **Go** for the service (standard library `net/http` 1.22 routing and `log/slog`, no framework).
+- **AWS Bedrock** for inference via the Converse and `ConverseStream` APIs.
+- **Server-Sent Events** for token streaming, read on the client with `fetch` + `ReadableStream`.
+- **`golang.org/x/time/rate`** for the per-key token-bucket limiter.
+- **React + TypeScript (Vite)** for the client that exercises the gateway in a browser.
+- **Docker** to containerize, **Terraform** for infrastructure, **GitHub Actions** for CI/CD to ECR.
+- **ECS Express Mode on Fargate** to run it.
+
+## Local development
+
+The fastest path is local: the Go service runs natively and talks to Bedrock, so no local database or
+container is required to see the full request path. It does call Bedrock, so the machine running it
+needs AWS credentials with **Bedrock access** and a Converse-stream model enabled in the region.
+
+**Prerequisites.** [Go 1.22+](https://go.dev/doc/install), [Docker](https://docs.docker.com/get-docker/),
+and AWS credentials configured (`aws configure`) with
+[model access](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html) enabled for a
+Claude model in your region.
+
+```bash
+# 1. Clone
+git clone https://github.com/Go-Santiago-Go/inference-gateway.git
+cd inference-gateway
+
+# 2. Configure. The server refuses to boot without at least one API key.
+export AWS_REGION=us-east-1                                            # region where Bedrock model access is enabled
+export API_KEYS=testkey                                               # comma-separated valid keys
+export BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0    # optional; this is the default
+
+# 3. Run the service. It reads AWS credentials from your environment / ~/.aws
+#    and listens on :8080.
+go run ./cmd/server
+
+# 4. In another terminal: stream a completion. -N disables curl buffering so
+#    tokens print as they arrive.
+curl -N -X POST localhost:8080/v1/chat \
+  -H "X-API-Key: testkey" -H "Content-Type: application/json" \
+  -d '{"prompt":"say hello in five words"}'
+# data: Hello,
+# data:  how are you today
+# data: ?
+# event: usage
+# data: {"tokens_in":14,"tokens_out":10,"cost_usd":0.000064,"latency_ms":1667}
+```
+
+Run it as the deployed artifact instead, a distroless container:
 
 ```bash
 docker build -t infer-gateway .
-docker run -p 8080:8080 \
-  -e AWS_REGION=us-east-1 \
-  -e API_KEYS=testkey \
-  infer-gateway
+docker run -p 8080:8080 -e AWS_REGION=us-east-1 -e API_KEYS=testkey infer-gateway
 ```
 
-Stream a completion:
+Development commands:
 
 ```bash
-curl -N -X POST http://localhost:8080/v1/chat \
+go build ./...   # build everything
+go vet ./...     # static checks (also runs in CI)
+go test ./...    # tests (also runs in CI)
+```
+
+CI runs `go build`, `go vet`, and `go test` on every push and pull request.
+
+## Endpoints
+
+### `POST /v1/chat`
+
+Streams a Bedrock completion back token by token over Server-Sent Events. The request is
+authenticated by the `X-API-Key` header against the set loaded from `API_KEYS`; an unknown or missing
+key is rejected with `401` in middleware, before any Bedrock call. The handler relays Bedrock
+`ConverseStream` events as `data:` frames, flushing each immediately, then emits a final
+`event: usage` frame carrying the request's token counts, cost, and latency, the same fields logged
+as one structured JSON line.
+
+```bash
+curl -N -X POST localhost:8080/v1/chat \
   -H "X-API-Key: testkey" -H "Content-Type: application/json" \
   -d '{"prompt":"Explain a token bucket rate limiter in two sentences."}'
+# data: A token bucket ...
+# ...
+# event: usage
+# data: {"tokens_in":18,"tokens_out":64,"cost_usd":0.0021,"latency_ms":840}
 ```
 
-Run the client:
+Request body: `{ "prompt": string }`. The prompt is required; a malformed or empty body returns
+`400`, a missing or unknown key returns `401`, and a Bedrock failure returns `500`. The request
+context threads into the SDK call, so a client disconnect cancels the upstream request instead of
+paying for unread tokens.
 
-```bash
-cd web
-npm install
-echo "VITE_API_BASE=http://localhost:8080" > .env
-npm run dev
-```
-
-## The stack, and why each choice
-
-- Go with the standard `net/http` (1.22 routing) and `log/slog`. Production-grade without a framework,
-  and structured logs are queryable in CloudWatch.
-- Server-Sent Events, not WebSockets, for streaming. The data flows one direction, server to client, and
-  SSE is plain HTTP, so it works through load balancers and `curl` with no handshake.
-- `fetch` with `ReadableStream` on the client, not `EventSource`. `EventSource` only issues `GET`
-  requests, and `/v1/chat` is a `POST` with a JSON body.
-- In-memory rate limiting. A single task makes per-key limiters correct and defensible. Redis is the
-  multi-task answer, listed below.
-- Retry only transient errors (throttling, transient 5xx), never 4xx. Retrying a bad request just wastes
-  calls. Backoff with jitter avoids a thundering herd.
-- Multi-stage Docker build shipping a distroless binary for a small image and attack surface.
-- Terraform for the AWS resources and GitHub Actions building and pushing the image to ECR, deployed on
-  ECS Express Mode.
-
-## Cost accounting
-
-Each Converse response carries input and output token counts. The meter multiplies those by a per-model
-price table to compute `cost_usd` per request, which is logged and returned to the client in the `usage`
-event. One request logs as:
+**Cost accounting.** Each Converse response carries input and output token counts. The meter
+multiplies those by a per-model price table to compute `cost_usd` per request, which is both returned
+in the `usage` event and logged, so spend is attributable per caller:
 
 ```json
 {"request_id":"...","key":"testkey","model":"...","tokens_in":18,"tokens_out":64,"cost_usd":0.0021,"latency_ms":840}
 ```
 
-> Add a screenshot or GIF of the client streaming and cancelling, and of a `429` firing under load, once
-> you have run it. Insert real measured numbers here rather than the illustrative values above.
+**Rate limiting.** Each API key gets its own token-bucket limiter (`golang.org/x/time/rate`, one
+limiter per key in a `sync.Map`), so a burst is absorbed up to the bucket size and then requests
+settle to the sustained refill rate. A key whose bucket is empty is rejected with `429 Too Many
+Requests` and a `Retry-After` header, in middleware, before the request reaches Bedrock. Firing 100
+concurrent requests at a single key with a demo-tuned burst of 5 shows the limiter engaging exactly at
+the burst size:
+
+```
+95 429   ← rejected in middleware, never reached Bedrock
+ 5 200   ← served
+```
+
+The rejected requests log `latency_ms: 0` because they short-circuit before the upstream call, so the
+limiter is a spending cap, not just a counter. The burst and rate are operational knobs; the demo
+value is deliberately low to make the behavior visible and the load test near-free.
+
+### `GET /health` · `GET /ready`
+
+Liveness and readiness probes for the load balancer and orchestrator. Both are open, outside the auth
+middleware, so they never require an API key.
+
+## Performance
+
+The gateway's own serving overhead is measured with Go benchmarks against the fake `Generator`, so no
+Bedrock call and no network are involved and the numbers reflect the pipeline's cost, not the model's
+latency. On an 8-core i9-9900K:
+
+| What | Overhead | Throughput |
+|---|---|---|
+| Full middleware chain (logging → CORS → auth → rate limit → SSE handler → metering) | ~24 µs/request | ~40K req/s per core (~210K aggregate) |
+| Rate-limit middleware alone | ~160 ns/request | near-flat under concurrency (160 → 185 ns across 16 goroutines) |
+
+The full-chain figure is the gateway's *own* cost, so the takeaway is that the gateway is not the
+throughput bottleneck; real throughput is bound by Bedrock latency and concurrency. The near-flat
+rate-limiter number under concurrency is the payoff of the `sync.Map` read path, which avoids the lock
+contention a mutex-guarded map would add.
+
+```bash
+# reproduce (no AWS, no cost)
+go test -run '^$' -bench . -benchmem ./internal/handler ./internal/middleware
+```
+
+## Writeups
+
+Build notes and explanations for the decisions behind this project are captured per phase in
+[`content/`](./content) and posted on LinkedIn:
+[christian-santiago-dev](https://www.linkedin.com/in/christian-santiago-dev/).
 
 ## Related projects
 
 Part of a portfolio arc that moves from building an AI capability, to composing it, to operating it.
 
-- [go-rag-api (Citely)](https://github.com/Go-Santiago-Go/go-rag-api): a Go RAG service on Bedrock. You
-  can build the core AI capability.
-- doc-agent (planned): a Strands agent that will consume Citely's `/query` as a tool, to demonstrate
+- [go-rag-api (Citely)](https://github.com/Go-Santiago-Go/go-rag-api): a Go RAG service on Bedrock,
+  deployed on AWS. Proves the core AI capability.
+- doc-agent (planned): a Strands agent that consumes Citely's `/query` as a tool, to demonstrate
   composing capabilities into a system.
-- infer-gateway (this repo): the serving, scaling, and observability layer in front of inference, with a
-  typed client that exercises it. You can operate it like a production engineer and work across the stack.
+- infer-gateway (this repo): the serving, scaling, and observability layer in front of inference,
+  with a typed client that exercises it. Proves operating inference like a production engineer.
 
 Concrete tie-in: Citely's generation call could itself sit behind this gateway, so the same Bedrock
 traffic that powers the RAG service would be rate-limited, retried, and cost-metered by this
 infrastructure.
-
-## What I'd add next
-
-- Request batching for a non-streaming `/v1/batch` path.
-- OpenTelemetry tracing with spans across `auth → ratelimit → bedrock → stream`.
-- Redis-backed rate limiting so limits hold across multiple tasks.
-- A `/metrics` Prometheus endpoint (RPS, p50/p95 latency, `429` rate, retry count).
-- Multi-provider routing behind one interface, and semantic response caching.
-- On the client: a request-history panel with a spend ledger and per-key usage charts.
