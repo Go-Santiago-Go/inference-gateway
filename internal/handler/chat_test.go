@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -63,6 +64,51 @@ func TestChat(t *testing.T) {
 	}
 	if math.Abs(resp.CostUSD-0.0055) > 1e-9 {
 		t.Errorf("CostUSD = %v, want %v", resp.CostUSD, 0.0055)
+	}
+}
+
+// TestChatGeneratorError drives the path a caller hits when Bedrock stays
+// throttled and withRetry exhausts its attempts: the error must surface as a
+// 502, naming the upstream as the failure, not the gateway.
+func TestChatGeneratorError(t *testing.T) {
+	gen := fakeGenerator{err: errors.New("bedrock: throttled after 3 attempts")}
+	h := New(gen, "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat", strings.NewReader(`{"prompt":"hi"}`))
+	rec := httptest.NewRecorder()
+
+	h.Chat(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	// The upstream error must not leak to the caller: it can name models,
+	// account IDs, or internals the client has no business seeing.
+	if body := rec.Body.String(); strings.Contains(body, "throttled after 3 attempts") {
+		t.Errorf("body leaks the upstream error: %q", body)
+	}
+}
+
+// TestChatStreamGeneratorError asserts the stream can still fail honestly. The
+// SSE headers are set before the generator is called, so this pins the ordering
+// that keeps them uncommitted: if a frame or flush ever moves above the call,
+// the status locks to 200 and the error becomes unreportable.
+func TestChatStreamGeneratorError(t *testing.T) {
+	gen := fakeGenerator{err: errors.New("bedrock: throttled after 3 attempts")}
+	h := New(gen, "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat", strings.NewReader(`{"prompt":"hi"}`))
+	rec := httptest.NewRecorder()
+
+	h.ChatStream(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	// A failed open is a plain error response, not a stream: the client must not
+	// be told to parse SSE from a body that will never carry frames.
+	if ct := rec.Header().Get("Content-Type"); ct == "text/event-stream" {
+		t.Errorf("Content-Type = %q, want a plain error response", ct)
 	}
 }
 
