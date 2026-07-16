@@ -62,8 +62,9 @@ func main() {
 	}
 
 	auth := middleware.Auth(apiKeys)
+	rateLimit := middleware.RateLimit(2, 5)
 	chat := handler.New(gen, modelID)
-	mux.Handle("POST /v1/chat", auth(http.HandlerFunc(chat.ChatStream)))
+	mux.Handle("POST /v1/chat", auth(rateLimit(http.HandlerFunc(chat.ChatStream))))
 
 	cors := middleware.CORS("http://localhost:5173")
 
