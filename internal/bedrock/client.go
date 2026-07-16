@@ -25,7 +25,13 @@ type Client struct {
 // New loads AWS configuration from the environment (credentials and region) and
 // returns a Client that generates with the given Bedrock model ID.
 func New(ctx context.Context, modelID string) (*Client, error) {
-	cfg, err := config.LoadDefaultConfig(ctx)
+	// The SDK retries by default (retry.Standard, 3 attempts). Left on, it would
+	// nest under withRetry for up to 9 calls per request on two stacked backoff
+	// schedules. One attempt here makes withRetry the single source of retry
+	// behavior, so maxAttempts means what it says.
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRetryMaxAttempts(1),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -42,16 +48,24 @@ func New(ctx context.Context, modelID string) (*Client, error) {
 func (c *Client) Generate(ctx context.Context, prompt string) (Completion, error) {
 	// Converse models a chat turn as a message holding content blocks; send one
 	// user message with a single text block.
-	out, err := c.api.Converse(ctx, &bedrockruntime.ConverseInput{
-		ModelId: aws.String(c.modelID),
-		Messages: []types.Message{
-			{
-				Role: types.ConversationRoleUser,
-				Content: []types.ContentBlock{
-					&types.ContentBlockMemberText{Value: prompt},
+	//
+	// out is assigned by the closure rather than returned, because withRetry's fn
+	// signature carries only an error.
+	var out *bedrockruntime.ConverseOutput
+	err := withRetry(ctx, func() error {
+		var err error
+		out, err = c.api.Converse(ctx, &bedrockruntime.ConverseInput{
+			ModelId: aws.String(c.modelID),
+			Messages: []types.Message{
+				{
+					Role: types.ConversationRoleUser,
+					Content: []types.ContentBlock{
+						&types.ContentBlockMemberText{Value: prompt},
+					},
 				},
 			},
-		},
+		})
+		return err
 	})
 	if err != nil {
 		return Completion{}, err
@@ -97,16 +111,26 @@ func (c *Client) GenerateStream(ctx context.Context, prompt string) (<-chan Chun
 	// Starting the stream can fail synchronously (bad model ID, auth); surface
 	// that as an ordinary error before any goroutine exists so the handler can
 	// still set a response status. The Messages shape matches Generate exactly.
-	out, err := c.api.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
-		ModelId: aws.String(c.modelID),
-		Messages: []types.Message{
-			{
-				Role: types.ConversationRoleUser,
-				Content: []types.ContentBlock{
-					&types.ContentBlockMemberText{Value: prompt},
+	//
+	// Only the open is retried. Once deltas are flowing the client has already
+	// received tokens, and Bedrock cannot resume mid-completion, so a retry would
+	// regenerate from scratch and duplicate or contradict what was already sent.
+	// Mid-stream failures end the stream instead.
+	var out *bedrockruntime.ConverseStreamOutput
+	err := withRetry(ctx, func() error {
+		var err error
+		out, err = c.api.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
+			ModelId: aws.String(c.modelID),
+			Messages: []types.Message{
+				{
+					Role: types.ConversationRoleUser,
+					Content: []types.ContentBlock{
+						&types.ContentBlockMemberText{Value: prompt},
+					},
 				},
 			},
-		},
+		})
+		return err
 	})
 	if err != nil {
 		return nil, err

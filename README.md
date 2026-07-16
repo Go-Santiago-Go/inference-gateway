@@ -19,11 +19,12 @@ One streaming endpoint, plus probes:
   API key, rate limited per key, and retried on transient failures.
 - `GET /health` and `GET /ready` for liveness and readiness.
 
-> **Project status:** built local-first, phase by phase. Phases 1 to 5 are done and verified end to
-> end (server, non-streaming Converse, per-key auth, SSE streaming, per-key rate limiting). Retries
-> (Phase 6) are the MVP cut line; the client and the AWS deploy follow. This README describes the full
-> target system, and the [Status](#status) section marks exactly what runs today. Nothing is deployed
-> yet, so there is no always-on URL to bill overnight.
+> **Project status:** built local-first, phase by phase. **Phases 1 to 6 are done and verified end to
+> end** (server, non-streaming Converse, per-key auth, SSE streaming, per-key rate limiting, retries
+> with backoff and jitter), which is the MVP cut line: the full request path runs locally and is
+> covered by tests that touch no AWS. The client and the AWS deploy follow. This README describes the
+> full target system, and the [Status](#status) section marks exactly what runs today. Nothing is
+> deployed yet, so there is no always-on URL to bill overnight.
 
 ## Architecture
 
@@ -128,6 +129,7 @@ without disturbing the core.
 | Rate limiting | In-memory token bucket per key | A single task makes per-key limiters correct and defensible, with zero extra infrastructure | Redis, leaky bucket, sliding window |
 | Rate-limit state | In-process (`sync.Map` of limiters) | No database in the MVP; the multi-task answer is Redis, and it is a stretch item | Redis-backed shared state |
 | Retries | Backoff + jitter, transient only | Retrying a `4xx` just wastes calls; jitter avoids a thundering herd on the backend | Retry everything, fixed backoff |
+| Retry ownership | Own loop, SDK retryer disabled | Two retryers nest to 9 calls per request on stacked schedules; one explicit loop keeps call counts predictable | Tune the SDK's `retry.Standard` |
 | Bedrock access | Behind a `Generator` interface | Handlers test against a fake with no AWS, and models swap without touching handler code | Call the SDK directly |
 | Cross-cutting concerns | Middleware chain | Auth, limits, metering, and logging each stay testable in isolation and the handler stays thin | Logic inside handlers |
 | Compute | ECS Express Mode on Fargate | Managed networking, load balancing, and scaling from an image; App Runner is closed to new customers | Full ECS Fargate |
@@ -152,8 +154,8 @@ end to end.
   Bedrock call (Phase 4)
 - [x] Per-key rate limiting with a token bucket: `429` plus a `Retry-After` header, verified under
   concurrent load (Phase 5)
-- [ ] Retries with exponential backoff and jitter, transient errors only, with tests in CI (Phase 6,
-  the MVP cut line)
+- [x] Retries with exponential backoff and jitter, transient errors only, cancellable mid-backoff,
+  with tests in CI (Phase 6, the MVP cut line)
 - [ ] React and TypeScript client that streams live and cancels with a Stop button (Phase 7)
 - [ ] Containerized with a distroless image, Terraform, and CI/CD to ECR, deployed on ECS Express
   Mode with a live public URL (Phases 8 to 9)
@@ -244,7 +246,8 @@ curl -N -X POST localhost:8080/v1/chat \
 ```
 
 Request body: `{ "prompt": string }`. The prompt is required; a malformed or empty body returns
-`400`, a missing or unknown key returns `401`, and a Bedrock failure returns `500`. The request
+`400`, a missing or unknown key returns `401`, a key over its limit returns `429`, and a Bedrock
+failure that survives retries returns `502` (the upstream failed, not the gateway). The request
 context threads into the SDK call, so a client disconnect cancels the upstream request instead of
 paying for unread tokens.
 
@@ -271,6 +274,41 @@ the burst size:
 The rejected requests log `latency_ms: 0` because they short-circuit before the upstream call, so the
 limiter is a spending cap, not just a counter. The burst and rate are operational knobs; the demo
 value is deliberately low to make the behavior visible and the load test near-free.
+
+**Retries.** Bedrock calls are wrapped in a retry loop that fires only on *transient* failures, the
+ones where re-sending the identical request could plausibly succeed: `ThrottlingException`,
+`ServiceUnavailableException`, `InternalServerException`, and `ModelTimeoutException`. Client errors
+(validation, auth, bad model ID) are never retried, because the identical request fails identically
+forever, so a retry only adds latency to the same error. Classification is by error *type* via
+`errors.As`, with a `smithy.APIError` code fallback for untyped errors, and an unrecognized error
+defaults to non-retryable: retry only on positive evidence.
+
+The schedule is exponential backoff plus jitter, capped at 3 attempts (1 original + 2 retries):
+
+```
+attempt 1 ─── 1s + jitter ─── attempt 2 ─── 2s + jitter ─── attempt 3
+```
+
+Backoff and jitter do different jobs and the design needs both. **Backoff is escalation**: each
+failure doubles the wait, so a struggling Bedrock gets progressively more room instead of being
+hammered by the retries themselves. **Jitter is desynchronization**: without a random nudge every
+throttled client computes the identical 1.000s and 2.000s and fires again simultaneously, so the
+thundering herd reforms on every round. Jitter smears them across a window (`[0, 250ms)` here) so
+Bedrock sees a trickle instead of a wall.
+
+**The wait is cancellable.** The backoff sleeps on a `select` over `time.After` and `ctx.Done()`
+rather than `time.Sleep`, which is uncancellable. A client that disconnects mid-backoff cancels the
+request context, the loop abandons the wait and returns immediately, and Bedrock is never called
+again. Without that, a disconnect during backoff is invisible until the sleep completes, and the
+gateway pays for a completion nobody will read.
+
+Two deliberate choices worth naming. The AWS SDK **retries by default** (`retry.Standard`, 3
+attempts), so it is explicitly disabled with `config.WithRetryMaxAttempts(1)`; left on, the two
+retryers nest and one logical request can hit Bedrock up to 9 times on two stacked backoff schedules.
+And for streaming, **only the stream open is retried, never mid-stream**: once deltas are flowing the
+client already holds tokens and Bedrock cannot resume mid-completion, so a retry would regenerate from
+scratch and duplicate or contradict what was already sent. The retry boundary belongs where the
+operation is still idempotent from the client's point of view.
 
 ### `GET /health` · `GET /ready`
 
