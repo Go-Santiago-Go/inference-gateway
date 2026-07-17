@@ -66,7 +66,7 @@ func main() {
 	chat := handler.New(gen, modelID)
 	mux.Handle("POST /v1/chat", auth(rateLimit(http.HandlerFunc(chat.ChatStream))))
 
-	cors := middleware.CORS("http://localhost:5173")
+	cors := middleware.CORS("http://localhost:5173", "http://127.0.0.1:5173")
 
 	// Compose the chain Logging -> CORS -> mux. Named root (not handler) to avoid
 	// shadowing the imported handler package. Logging is outermost so it wraps

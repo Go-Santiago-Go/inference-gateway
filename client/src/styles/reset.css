@@ -1,0 +1,87 @@
+/* Andy Bell's "a (more) modern CSS reset", adapted.
+   https://piccalil.li/blog/a-more-modern-css-reset/
+   Modern browsers are consistent, so this strips only what fights authored CSS
+   rather than flattening every default. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* Stop mobile browsers inflating font sizes on orientation change. */
+html {
+  -moz-text-size-adjust: none;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
+}
+
+/* Drop UA margins so spacing is deliberate, set once by the layout. */
+body,
+h1,
+h2,
+h3,
+h4,
+p,
+figure,
+blockquote,
+dl,
+dd {
+  margin: 0;
+}
+
+ul[role="list"],
+ol[role="list"] {
+  list-style: none;
+  padding: 0;
+}
+
+body {
+  min-height: 100vh;
+  line-height: 1.5;
+}
+
+/* Tighter leading on headings and interactive controls. */
+h1,
+h2,
+h3,
+h4,
+button,
+input,
+label {
+  line-height: 1.1;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  text-wrap: balance;
+}
+
+/* Form controls do not inherit font by default; make them match the app. */
+input,
+button,
+textarea,
+select {
+  font: inherit;
+}
+
+img,
+picture {
+  max-width: 100%;
+  display: block;
+}
+
+/* Honor a user's OS request to reduce motion: near-instant animations and
+   transitions instead of movement they may find nauseating. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

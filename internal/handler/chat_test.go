@@ -21,7 +21,7 @@ type fakeGenerator struct {
 	err  error
 }
 
-func (f fakeGenerator) Generate(ctx context.Context, prompt string) (bedrock.Completion, error) {
+func (f fakeGenerator) Generate(ctx context.Context, messages []bedrock.Message) (bedrock.Completion, error) {
 	return f.comp, f.err
 }
 
@@ -29,7 +29,7 @@ func (f fakeGenerator) Generate(ctx context.Context, prompt string) (bedrock.Com
 // fake completion's text as one chunk, then a usage chunk carrying the token
 // counts, then closes. This lets the streaming handler be tested offline. It
 // honors f.err so a test can drive the start-of-stream error path.
-func (f fakeGenerator) GenerateStream(ctx context.Context, prompt string) (<-chan bedrock.Chunk, error) {
+func (f fakeGenerator) GenerateStream(ctx context.Context, messages []bedrock.Message) (<-chan bedrock.Chunk, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -46,7 +46,7 @@ func TestChat(t *testing.T) {
 	gen := fakeGenerator{comp: bedrock.Completion{Text: "hello", TokensIn: 1500, TokensOut: 800}}
 	h := New(gen, "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat", strings.NewReader(`{"prompt":"hi"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 
 	h.Chat(rec, req)
@@ -74,7 +74,7 @@ func TestChatGeneratorError(t *testing.T) {
 	gen := fakeGenerator{err: errors.New("bedrock: throttled after 3 attempts")}
 	h := New(gen, "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat", strings.NewReader(`{"prompt":"hi"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 
 	h.Chat(rec, req)
@@ -89,6 +89,46 @@ func TestChatGeneratorError(t *testing.T) {
 	}
 }
 
+// TestChatStreamMultilineText pins the SSE encoding of text containing newlines,
+// which is most model output: paragraphs, lists, and code blocks all carry them.
+// A blank line terminates a frame, so writing such text as one data line would
+// truncate the frame at the first break and silently drop the rest. The frame
+// must instead carry one data line per line of text, which a client rejoins with
+// "\n" to recover the original exactly.
+func TestChatStreamMultilineText(t *testing.T) {
+	const text = "Hello\n\nWorld"
+	gen := fakeGenerator{comp: bedrock.Completion{Text: text, TokensIn: 1500, TokensOut: 800}}
+	h := New(gen, "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+
+	h.ChatStream(rec, req)
+
+	body := rec.Body.String()
+
+	// The token frame must end at the first blank line only after every line of
+	// the payload has been written.
+	frame, _, found := strings.Cut(body, "\n\n")
+	if !found {
+		t.Fatalf("body has no terminated frame; got:\n%q", body)
+	}
+
+	// Decode the frame the way a spec-compliant client does: take each data
+	// line's value and join them with "\n".
+	var lines []string
+	for line := range strings.SplitSeq(frame, "\n") {
+		value, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			t.Fatalf("frame line %q is not a data line; the frame was truncated early", line)
+		}
+		lines = append(lines, strings.TrimPrefix(value, " "))
+	}
+	if got := strings.Join(lines, "\n"); got != text {
+		t.Errorf("decoded text = %q, want %q", got, text)
+	}
+}
+
 // TestChatStreamGeneratorError asserts the stream can still fail honestly. The
 // SSE headers are set before the generator is called, so this pins the ordering
 // that keeps them uncommitted: if a frame or flush ever moves above the call,
@@ -97,7 +137,7 @@ func TestChatStreamGeneratorError(t *testing.T) {
 	gen := fakeGenerator{err: errors.New("bedrock: throttled after 3 attempts")}
 	h := New(gen, "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat", strings.NewReader(`{"prompt":"hi"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 
 	h.ChatStream(rec, req)
@@ -119,7 +159,7 @@ func TestChatStream(t *testing.T) {
 	gen := fakeGenerator{comp: bedrock.Completion{Text: "hello", TokensIn: 1500, TokensOut: 800}}
 	h := New(gen, "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat", strings.NewReader(`{"prompt":"hi"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 
 	h.ChatStream(rec, req)

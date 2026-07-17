@@ -6,17 +6,26 @@ package bedrock
 
 import "context"
 
-// Generator produces a completion for a prompt. It is the seam between the
+// Message is one turn of a conversation passed to the model: a role
+// ("user" or "assistant") and its text. A single-turn request is a slice of one
+// user Message; a multi-turn request carries the alternating history, which the
+// stateless gateway resends in full each turn because Bedrock holds no session.
+type Message struct {
+	Role string
+	Text string
+}
+
+// Generator produces a completion for a conversation. It is the seam between the
 // handler and Bedrock: the handler holds a Generator, not a concrete client, so
 // tests can substitute a fake and production can substitute the real client.
 type Generator interface {
-	Generate(ctx context.Context, prompt string) (Completion, error)
+	Generate(ctx context.Context, messages []Message) (Completion, error)
 
-	// GenerateStream streams a completion as it is producted. It returns a
+	// GenerateStream streams a completion as it is produced. It returns a
 	// receive-only channel of chunks the caller ranges over until it closes.
 	// The producer owns the channel and closes it when generation ends or ctx
 	// is cancelled, so a client disconnect stops the upstream call.
-	GenerateStream(ctx context.Context, prompt string) (<-chan Chunk, error)
+	GenerateStream(ctx context.Context, messages []Message) (<-chan Chunk, error)
 }
 
 // Completion is the result of one generation. It carries the generated

@@ -29,9 +29,38 @@ func New(gen bedrock.Generator, model string) *Handler {
 	return &Handler{gen: gen, model: model}
 }
 
+// chatMessage is one turn in the request: a role ("user" or "assistant") and its
+// text. The client resends the whole history each turn because the gateway is
+// stateless.
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 // chatRequest is the JSON body accepted by POST /v1/chat.
 type chatRequest struct {
-	Prompt string `json:"prompt"`
+	Messages []chatMessage `json:"messages"`
+}
+
+// toMessages validates the request's conversation and maps it onto the bedrock
+// message type. It returns false when the conversation is unusable: empty, a turn
+// with no content, or a final turn that is not the user's (there would be nothing
+// new to answer). Validating here keeps a malformed body from reaching Bedrock.
+func (req chatRequest) toMessages() ([]bedrock.Message, bool) {
+	if len(req.Messages) == 0 {
+		return nil, false
+	}
+	msgs := make([]bedrock.Message, len(req.Messages))
+	for i, m := range req.Messages {
+		if m.Content == "" || (m.Role != "user" && m.Role != "assistant") {
+			return nil, false
+		}
+		msgs[i] = bedrock.Message{Role: m.Role, Text: m.Content}
+	}
+	if req.Messages[len(req.Messages)-1].Role != "user" {
+		return nil, false
+	}
+	return msgs, true
 }
 
 // chatResponse is the successful JSON response: the completion text plus the
@@ -51,7 +80,8 @@ type chatResponse struct {
 // meters the cost, logs the usage, and writes the completion as JSON.
 func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 	var req chatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Prompt == "" {
+	messages, ok := decodeChat(r, &req)
+	if !ok {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -59,7 +89,7 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 	key := middleware.KeyFromContext(r.Context())
 
 	start := time.Now()
-	comp, err := h.gen.Generate(r.Context(), req.Prompt) // cancellation propagates
+	comp, err := h.gen.Generate(r.Context(), messages) // cancellation propagates
 	if err != nil {
 		http.Error(w, "generation failed", http.StatusBadGateway)
 		return
@@ -84,6 +114,16 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 		CostUSD:   cost,
 		LatencyMs: latency.Milliseconds(),
 	})
+}
+
+// decodeChat decodes and validates a chat request body, returning the mapped
+// messages and false if the body is malformed. Shared by the streaming and
+// non-streaming handlers so both reject the same bad input identically.
+func decodeChat(r *http.Request, req *chatRequest) ([]bedrock.Message, bool) {
+	if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+		return nil, false
+	}
+	return req.toMessages()
 }
 
 // writeJSON sets the JSON content type and encodes v directly to the response

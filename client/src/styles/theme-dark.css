@@ -1,0 +1,36 @@
+/* Dark theme. Kept separate from the light tokens in tokens.css and scoped to
+   the [data-theme="dark"] override, which an inline script in index.html sets
+   before first paint (from localStorage, else the system preference).
+
+   Only tokens that differ from light are redeclared; --accent-solid and
+   --on-accent are shared and stay in :root. Every text/surface pair here was
+   verified at WCAG AA (>=4.5:1); dark elevation runs the opposite of light
+   (surfaces get lighter as they rise). */
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Surfaces */
+  --bg: #141311;
+  --rail: #1f1d19;
+  --card: #2a2823;
+  --panel: #191815;
+  --border: #3a372f;
+
+  /* Text */
+  --ink: #f2f1ec;
+  --muted: #b4b2a9;
+  --faint: #928f86;
+
+  /* Accent */
+  --accent: #77b6f0;
+  --accent-bg: #16293c;
+
+  /* Status */
+  --ok: #4ecfa6;
+  --ok-bg: #123027;
+  --warn: #e2b478;
+  --warn-bg: #392c17;
+  --danger: #ec9090;
+  --danger-bg: #3a2020;
+}

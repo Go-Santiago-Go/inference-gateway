@@ -41,29 +41,37 @@ func New(ctx context.Context, modelID string) (*Client, error) {
 	}, nil
 }
 
-// Generate sends the prompt to Bedrock's Converse API and returns the completion
-// with its token counts. The context flows into the SDK call, so a client
-// disconnect cancels the in-flight request instead of paying for a dropped
-// response.
-func (c *Client) Generate(ctx context.Context, prompt string) (Completion, error) {
-	// Converse models a chat turn as a message holding content blocks; send one
-	// user message with a single text block.
-	//
+// toBedrockMessages maps the interface's Message slice onto the SDK's message
+// shape: one content block of text per turn, with the role translated. An
+// unrecognized role falls back to user, the only role a single-turn caller sends.
+func toBedrockMessages(messages []Message) []types.Message {
+	out := make([]types.Message, len(messages))
+	for i, m := range messages {
+		role := types.ConversationRoleUser
+		if m.Role == "assistant" {
+			role = types.ConversationRoleAssistant
+		}
+		out[i] = types.Message{
+			Role:    role,
+			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: m.Text}},
+		}
+	}
+	return out
+}
+
+// Generate sends the conversation to Bedrock's Converse API and returns the
+// completion with its token counts. The context flows into the SDK call, so a
+// client disconnect cancels the in-flight request instead of paying for a
+// dropped response.
+func (c *Client) Generate(ctx context.Context, messages []Message) (Completion, error) {
 	// out is assigned by the closure rather than returned, because withRetry's fn
 	// signature carries only an error.
 	var out *bedrockruntime.ConverseOutput
 	err := withRetry(ctx, func() error {
 		var err error
 		out, err = c.api.Converse(ctx, &bedrockruntime.ConverseInput{
-			ModelId: aws.String(c.modelID),
-			Messages: []types.Message{
-				{
-					Role: types.ConversationRoleUser,
-					Content: []types.ContentBlock{
-						&types.ContentBlockMemberText{Value: prompt},
-					},
-				},
-			},
+			ModelId:  aws.String(c.modelID),
+			Messages: toBedrockMessages(messages),
 		})
 		return err
 	})
@@ -107,7 +115,7 @@ func (c *Client) Generate(ctx context.Context, prompt string) (Completion, error
 // the token counts before closing. The channel closes when the model finishes,
 // ctx is cancelled, or the stream errors, so a client disconnect stops the
 // upstream call instead of paying for tokens no one will read.
-func (c *Client) GenerateStream(ctx context.Context, prompt string) (<-chan Chunk, error) {
+func (c *Client) GenerateStream(ctx context.Context, messages []Message) (<-chan Chunk, error) {
 	// Starting the stream can fail synchronously (bad model ID, auth); surface
 	// that as an ordinary error before any goroutine exists so the handler can
 	// still set a response status. The Messages shape matches Generate exactly.
@@ -120,15 +128,8 @@ func (c *Client) GenerateStream(ctx context.Context, prompt string) (<-chan Chun
 	err := withRetry(ctx, func() error {
 		var err error
 		out, err = c.api.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
-			ModelId: aws.String(c.modelID),
-			Messages: []types.Message{
-				{
-					Role: types.ConversationRoleUser,
-					Content: []types.ContentBlock{
-						&types.ContentBlockMemberText{Value: prompt},
-					},
-				},
-			},
+			ModelId:  aws.String(c.modelID),
+			Messages: toBedrockMessages(messages),
 		})
 		return err
 	})
