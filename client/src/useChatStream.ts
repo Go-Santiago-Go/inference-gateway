@@ -141,7 +141,21 @@ export function useChatStream() {
     setChatState({ status: "idle" });
   }
 
+  // clearError dismisses an error state without touching history, so the app can
+  // return to idle when a rate-limit countdown ends.
+  function clearError() {
+    setChatState((prev) => (prev.status === "error" ? { status: "idle" } : prev));
+  }
+
   const conversationTotal = useMemo(() => total(history), [history]);
 
-  return { history, chatState, total: conversationTotal, send, stop, reset };
+  return {
+    history,
+    chatState,
+    total: conversationTotal,
+    send,
+    stop,
+    reset,
+    clearError,
+  };
 }

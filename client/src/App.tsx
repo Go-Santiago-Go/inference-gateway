@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useChatStream } from "./useChatStream";
 import { useTheme } from "./useTheme";
 import type { ChatState } from "./types";
@@ -31,25 +31,58 @@ function pillLabel(state: ChatState): string {
   }
 }
 
-function bannerText(state: Extract<ChatState, { status: "error" }>): string {
+function bannerText(
+  state: Extract<ChatState, { status: "error" }>,
+  secondsLeft: number,
+): string {
   switch (state.kind) {
     case "unauthorized":
       return "Unauthorized. Check your API key and try again.";
     case "rate_limited":
-      return `Rate limited. Try again in ${state.retryAfter}s.`;
+      return `Rate limited. Try again in ${secondsLeft}s.`;
     case "network":
       return "Couldn't reach the gateway. Retry.";
   }
 }
 
 export default function App() {
-  const { history, chatState, total, send, stop, reset } = useChatStream();
+  const { history, chatState, total, send, stop, reset, clearError } =
+    useChatStream();
   const { theme, toggle } = useTheme();
   const [prompt, setPrompt] = useState("");
   const [apiKey, setApiKey] = useState(DEFAULT_KEY);
 
   // The conversation's title is its first user message; null before anything sent.
   const title = history.find((t) => t.role === "user")?.content ?? null;
+
+  // Rate-limit countdown. While rate limited, tick a visible seconds value down
+  // and dismiss the error when it reaches zero, so Send re-enables on its own.
+  const rateLimited =
+    chatState.status === "error" && chatState.kind === "rate_limited";
+  const retryAfter = rateLimited ? chatState.retryAfter : 0;
+  const [secondsLeft, setSecondsLeft] = useState(0);
+
+  useEffect(() => {
+    if (!rateLimited) {
+      setSecondsLeft(0);
+      return;
+    }
+    setSecondsLeft(retryAfter);
+    const tick = setInterval(
+      () => setSecondsLeft((s) => Math.max(0, s - 1)),
+      1000,
+    );
+    // A separate timeout clears the error, so this never sets state from inside
+    // the interval's updater.
+    const done = setTimeout(clearError, retryAfter * 1000);
+    return () => {
+      clearInterval(tick);
+      clearTimeout(done);
+    };
+    // Keyed on the rate-limit state and its duration. clearError is omitted: it
+    // only ever calls a stable setter with a pure updater, so a stale closure of
+    // it is harmless.
+  }, [rateLimited, retryAfter]);
 
   // Stick-to-bottom autoscroll. threadRef is the scroll container; stick tracks
   // whether the user is near the bottom. We only pin to the bottom while they
@@ -71,9 +104,9 @@ export default function App() {
   }, [history, chatState]);
 
   function handleSend() {
-    // Guard against a second request while one streams: the Send button is hidden
-    // then, but the Enter key would otherwise still start an overlapping turn.
-    if (chatState.status === "streaming") return;
+    // Guard against a send while streaming or mid-countdown: the Send button is
+    // hidden/disabled then, but the Enter key would otherwise still fire.
+    if (chatState.status === "streaming" || secondsLeft > 0) return;
     const trimmed = prompt.trim();
     if (!trimmed) return;
     send(trimmed, apiKey);
@@ -133,7 +166,7 @@ export default function App() {
 
           {chatState.status === "error" && (
             <div className={`banner banner--${chatState.kind}`} role="alert">
-              {bannerText(chatState)}
+              {bannerText(chatState, secondsLeft)}
             </div>
           )}
 
@@ -149,7 +182,7 @@ export default function App() {
           onPromptChange={setPrompt}
           onSubmit={handleSend}
           onStop={stop}
-          canSend={prompt.trim().length > 0}
+          canSend={prompt.trim().length > 0 && secondsLeft === 0}
         />
       </main>
     </div>
