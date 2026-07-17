@@ -18,7 +18,7 @@ that order. **Phase 7 is the MVP cut line**; everything after is AWS deployment.
 A containerized Go service in front of AWS Bedrock that adds the production operations layer around
 LLM inference (SSE token streaming, per-key API-key auth, per-key rate limiting, retries with
 backoff + jitter, and per-request token/cost accounting via structured `slog` logs), plus a React +
-TypeScript client (`web/`) that makes each of those features visible in a browser.
+TypeScript client (`client/`) that makes each of those features visible in a browser.
 
 ## Commands (as scaffolded per the build plan)
 
@@ -38,11 +38,11 @@ docker build -t infer-gateway .
 docker run -p 8080:8080 -e AWS_REGION=us-east-1 -e API_KEYS=testkey infer-gateway
 ```
 
-Web client (`web/`, Vite + React + TS):
+Web client (`client/`, Vite + React + TS):
 ```bash
-cd web && npm install
-npm run dev                # VITE_API_BASE=http://localhost:8080 in web/.env
-npm run build              # emits web/dist
+cd client && npm install
+npm run dev                # VITE_API_BASE=http://localhost:8080 in client/.env
+npm run build              # emits client/dist
 ```
 
 Smoke-test the stream and the rate limiter:
@@ -53,7 +53,7 @@ curl -N -X POST http://localhost:8080/v1/chat \
 hey -n 200 -c 20 -H "X-API-Key: testkey" -m POST -d '{"prompt":"hi"}' http://localhost:8080/v1/chat
 ```
 
-CI (`.github/workflows/ci.yml`) runs `go build`/`go vet`/`go test`; a `web/` build job is added in
+CI (`.github/workflows/ci.yml`) runs `go build`/`go vet`/`go test`; a `client/` build job is added in
 Phase 7.
 
 ## Architecture (the big picture)
@@ -87,7 +87,7 @@ The client reads it with `fetch` + `ReadableStream` (**not** `EventSource`, whic
 `AbortController` for Stop.
 
 Planned Go layout: `cmd/server/` (wires middleware + handler, starts server) · `internal/handler`,
-`internal/middleware`, `internal/bedrock`, `internal/meter` · `web/` (client) · `infra/` (Terraform,
+`internal/middleware`, `internal/bedrock`, `internal/meter` · `client/` (the web client) · `infra/` (Terraform,
 Phase 8+).
 
 ## Key design decisions to preserve

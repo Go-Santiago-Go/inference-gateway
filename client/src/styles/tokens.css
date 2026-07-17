@@ -1,0 +1,65 @@
+/* Design tokens, lifted from infer-gateway-ui-mock.html (the visual source of
+   truth). Every color, radius, and font in the app resolves to one of these, so
+   the mock's look is defined in one place and nowhere else. */
+
+/* Light theme: the default token values live here in :root. Dark overrides are
+   kept separate in theme-dark.css, scoped to [data-theme="dark"]. */
+:root {
+  /* Tells the browser to render native controls/scrollbars for a light UI. The
+     dark theme flips this in theme-dark.css. */
+  color-scheme: light;
+
+  /* Surfaces, an elevation scale with perceptible luminance steps between each
+     layer: page (bg) sits below the rail chrome, the white card floats above
+     both, and the input panel is clearly recessed within the card. */
+  --bg: #e4e0d6;
+  --rail: #f2f0ea;
+  --card: #ffffff;
+  --panel: #ebe8e0;
+  --border: #d8d5cc;
+
+  /* Text. muted and faint are darkened enough to keep WCAG AA (>=4.5:1) on the
+     darkest surface each appears on (panel and rail respectively); faint stays
+     lighter than muted so the emphasis hierarchy reads. */
+  --ink: #1f1f1d;
+  --muted: #66655f;
+  --faint: #6e6d64;
+
+  /* Accent (brand blue) */
+  --accent: #185fa5;
+  --accent-bg: #e6f1fb;
+  --accent-solid: #2665b0; /* darkened so white text/icon clears AA (5.88:1) */
+  --on-accent: #ffffff; /* text/icon on a solid accent fill */
+
+  /* Status: ok / warn / danger, each with a tinted background */
+  --ok: #0f6e56;
+  --ok-bg: #e1f5ee;
+  --warn: #854f0b;
+  --warn-bg: #faeeda;
+  --danger: #a32d2d;
+  --danger-bg: #fcebeb;
+
+  /* Type families */
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+
+  /* Type scale in rem, so every size scales with the user's browser font size.
+     --font-md is the 16px accessible floor used for primary reading content. */
+  --font-xs: 0.75rem; /* 12px: chips, meta labels */
+  --font-sm: 0.875rem; /* 14px: rail items, subtitles */
+  --font-md: 1rem; /* 16px: message and reply body */
+  --font-lg: 1.0625rem; /* 17px: emphasis */
+
+  /* Spacing scale, used by the Stack primitive's --space and paddings. */
+  --space-2xs: 0.25rem;
+  --space-xs: 0.5rem;
+  --space-s: 0.75rem;
+  --space-m: 1.125rem;
+  --space-l: 1.375rem;
+
+  /* Radii */
+  --radius-s: 6px;
+  --radius-m: 11px;
+  --radius-l: 16px;
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Go-Santiago-Go/inference-gateway/internal/meter"
@@ -19,7 +20,8 @@ import (
 // tokens.
 func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	var req chatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Prompt == "" {
+	messages, ok := decodeChat(r, &req)
+	if !ok {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -40,7 +42,7 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	key := middleware.KeyFromContext(r.Context())
 
 	start := time.Now()
-	stream, err := h.gen.GenerateStream(r.Context(), req.Prompt)
+	stream, err := h.gen.GenerateStream(r.Context(), messages)
 	if err != nil {
 		// Must return: on error stream is nil, and ranging a nil channel blocks
 		// forever. This can still set a status because no frame has been sent.
@@ -53,7 +55,15 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	var tokensIn, tokensOut int
 	for chunk := range stream {
 		if chunk.Text != "" {
-			fmt.Fprintf(w, "data: %s\n\n", chunk.Text)
+			// A blank line terminates an SSE frame, so text containing newlines
+			// cannot be written as a single data line without truncating the
+			// frame at the model's first paragraph break. The spec's encoding is
+			// one data line per line of payload, which the client rejoins with
+			// "\n".
+			for line := range strings.SplitSeq(chunk.Text, "\n") {
+				fmt.Fprintf(w, "data: %s\n", line)
+			}
+			fmt.Fprint(w, "\n")
 			flusher.Flush()
 		}
 		if chunk.TokensIn != 0 || chunk.TokensOut != 0 {

@@ -19,12 +19,12 @@ One streaming endpoint, plus probes:
   API key, rate limited per key, and retried on transient failures.
 - `GET /health` and `GET /ready` for liveness and readiness.
 
-> **Project status:** built local-first, phase by phase. **Phases 1 to 6 are done and verified end to
+> **Project status:** built local-first, phase by phase. **Phases 1 to 7 are done and verified end to
 > end** (server, non-streaming Converse, per-key auth, SSE streaming, per-key rate limiting, retries
-> with backoff and jitter), which is the MVP cut line: the full request path runs locally and is
-> covered by tests that touch no AWS. The client and the AWS deploy follow. This README describes the
-> full target system, and the [Status](#status) section marks exactly what runs today. Nothing is
-> deployed yet, so there is no always-on URL to bill overnight.
+> with backoff and jitter, and the React + TypeScript client): the full request path runs locally,
+> streams into a browser, and is covered by tests that touch no AWS. The AWS deploy (Phases 8 to 9)
+> follows. This README describes the full target system, and the [Status](#status) section marks
+> exactly what runs today. Nothing is deployed yet, so there is no always-on URL to bill overnight.
 
 ## Architecture
 
@@ -156,7 +156,10 @@ end to end.
   concurrent load (Phase 5)
 - [x] Retries with exponential backoff and jitter, transient errors only, cancellable mid-backoff,
   with tests in CI (Phase 6, the MVP cut line)
-- [ ] React and TypeScript client that streams live and cancels with a Stop button (Phase 7)
+- [x] React and TypeScript client: live SSE streaming read with `fetch` + `ReadableStream`, a Stop
+  button backed by `AbortController`, the request lifecycle modeled as a discriminated union with
+  clean `401`/`429` states, per-request and cumulative-conversation cost, multi-turn conversations,
+  Markdown rendering, and a dark/light theme, all with WCAG-AA-verified contrast (Phase 7)
 - [ ] Containerized with a distroless image, Terraform, and CI/CD to ECR, deployed on ECS Express
   Mode with a live public URL (Phases 8 to 9)
 
@@ -190,6 +193,8 @@ cd inference-gateway
 export AWS_REGION=us-east-1                                            # region where Bedrock model access is enabled
 export API_KEYS=testkey                                               # comma-separated valid keys
 export BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0    # optional; this is the default
+export RATE_LIMIT_RPS=2                                               # optional; per-key refill rate (req/s), default 2
+export RATE_LIMIT_BURST=5                                             # optional; per-key bucket size, default 5
 
 # 3. Run the service. It reads AWS credentials from your environment / ~/.aws
 #    and listens on :8080.
@@ -199,12 +204,21 @@ go run ./cmd/server
 #    tokens print as they arrive.
 curl -N -X POST localhost:8080/v1/chat \
   -H "X-API-Key: testkey" -H "Content-Type: application/json" \
-  -d '{"prompt":"say hello in five words"}'
+  -d '{"messages":[{"role":"user","content":"say hello in five words"}]}'
 # data: Hello,
 # data:  how are you today
 # data: ?
 # event: usage
 # data: {"tokens_in":14,"tokens_out":10,"cost_usd":0.000064,"latency_ms":1667}
+```
+
+**Run the web client too.** With the gateway running on `:8080`, start the client so you can watch
+the stream, cancel it, and see per-request and cumulative cost in the browser:
+
+```bash
+cd client
+npm install
+npm run dev   # http://localhost:5173 · reads VITE_API_BASE from client/.env (default http://localhost:8080)
 ```
 
 Run it as the deployed artifact instead, a distroless container:
@@ -222,7 +236,8 @@ go vet ./...     # static checks (also runs in CI)
 go test ./...    # tests (also runs in CI)
 ```
 
-CI runs `go build`, `go vet`, and `go test` on every push and pull request.
+CI runs two jobs on every push and pull request: `go build`/`go vet`/`go test` for the service, and
+`npm ci`/`npm run build`/`npm test` for the client, so a broken frontend fails the pipeline too.
 
 ## Endpoints
 
@@ -238,18 +253,19 @@ as one structured JSON line.
 ```bash
 curl -N -X POST localhost:8080/v1/chat \
   -H "X-API-Key: testkey" -H "Content-Type: application/json" \
-  -d '{"prompt":"Explain a token bucket rate limiter in two sentences."}'
+  -d '{"messages":[{"role":"user","content":"Explain a token bucket rate limiter in two sentences."}]}'
 # data: A token bucket ...
 # ...
 # event: usage
 # data: {"tokens_in":18,"tokens_out":64,"cost_usd":0.0021,"latency_ms":840}
 ```
 
-Request body: `{ "prompt": string }`. The prompt is required; a malformed or empty body returns
-`400`, a missing or unknown key returns `401`, a key over its limit returns `429`, and a Bedrock
-failure that survives retries returns `502` (the upstream failed, not the gateway). The request
-context threads into the SDK call, so a client disconnect cancels the upstream request instead of
-paying for unread tokens.
+Request body: `{ "messages": [{ "role": "user" | "assistant", "content": string }] }`. The gateway is
+stateless, so a multi-turn conversation resends the full history each turn and the final message must
+be the user's; a malformed body, an empty history, or a non-user final turn returns `400`. A missing
+or unknown key returns `401`, a key over its limit returns `429`, and a Bedrock failure that survives
+retries returns `502` (the upstream failed, not the gateway). The request context threads into the
+SDK call, so a client disconnect cancels the upstream request instead of paying for unread tokens.
 
 **Cost accounting.** Each Converse response carries input and output token counts. The meter
 multiplies those by a per-model price table to compute `cost_usd` per request, which is both returned
@@ -314,6 +330,43 @@ operation is still idempotent from the client's point of view.
 
 Liveness and readiness probes for the load balancer and orchestrator. Both are open, outside the auth
 middleware, so they never require an API key.
+
+## Web client
+
+The gateway's features are invisible by default: streaming, cancellation, per-key auth, rate limiting,
+and cost accounting all happen inside the box. The client (`client/`, Vite + React + TypeScript) is a
+lens where each piece of the UI maps to one real backend capability, so the gateway can be *watched*
+working rather than taken on faith.
+
+| What you see | Backend capability |
+|---|---|
+| Tokens appear one at a time with a blinking cursor | SSE streaming relayed with `http.Flusher` |
+| A Stop button freezes the answer mid-stream | request-context cancellation into the Bedrock call |
+| A wrong API key shows a clean unauthorized state | per-key auth middleware (`401`) |
+| Sending too fast shows a rate-limited state | per-key token bucket (`429` + `Retry-After`) |
+| Per-reply footer: tokens in/out, cost, latency | the `usage` event |
+| A running conversation total | client-side accumulation of each turn's `usage` |
+
+The last row is the point of the cost story: because the stateless gateway resends the full history
+every turn, input tokens climb per turn, so a conversation costs more than the sum of its prompts in
+isolation. The total makes that growth visible on screen.
+
+Two implementation choices worth naming. The stream is read with `fetch` + `ReadableStream`, not
+`EventSource`, because `EventSource` only issues `GET` and `/v1/chat` is a `POST` with a JSON body;
+the client buffers network reads and splits them on the SSE frame delimiter itself. And the whole
+request lifecycle is a TypeScript **discriminated union** (`idle | streaming | done | error`), so the
+compiler enforces that every state is handled and an illegal state (say, cost before completion) is
+unrepresentable. Model output is rendered with `react-markdown`, which is safe by default: it escapes
+raw HTML and neutralizes `javascript:` URLs, and no `rehype-raw` is enabled, so no sanitizer is
+needed.
+
+```bash
+cd client
+npm install
+npm run dev     # http://localhost:5173
+npm run build   # type-checks and emits client/dist
+npm test        # SSE frame-parser unit tests (vitest)
+```
 
 ## Performance
 

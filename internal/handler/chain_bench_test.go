@@ -52,7 +52,7 @@ func BenchmarkChainThroughput(b *testing.B) {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	chain := buildChain()
 
-	const body = `{"prompt":"hi"}`
+	const body = `{"messages":[{"role":"user","content":"hi"}]}`
 	w := &benchWriter{}
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat", nil)
 	req.Header.Set("X-API-Key", "benchkey")
@@ -71,7 +71,7 @@ func BenchmarkChainThroughputParallel(b *testing.B) {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	chain := buildChain()
 
-	const body = `{"prompt":"hi"}`
+	const body = `{"messages":[{"role":"user","content":"hi"}]}`
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
