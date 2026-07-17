@@ -12,7 +12,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+
+	"golang.org/x/time/rate"
 
 	"github.com/Go-Santiago-Go/inference-gateway/internal/bedrock"
 	"github.com/Go-Santiago-Go/inference-gateway/internal/handler"
@@ -61,8 +64,15 @@ func main() {
 		log.Fatalf("bedrock client: %v", err)
 	}
 
+	// Rate-limit knobs are config, not code, like the keys and model above: the
+	// refill rate (requests/sec) and burst size are env-overridable so an operator
+	// can tune the cap, or a demo can set a tiny limit to make 429s easy to see,
+	// without a rebuild. Defaults suit a single task.
+	rps := envFloat("RATE_LIMIT_RPS", 2)
+	burst := envInt("RATE_LIMIT_BURST", 5)
+
 	auth := middleware.Auth(apiKeys)
-	rateLimit := middleware.RateLimit(2, 5)
+	rateLimit := middleware.RateLimit(rate.Limit(rps), burst)
 	chat := handler.New(gen, modelID)
 	mux.Handle("POST /v1/chat", auth(rateLimit(http.HandlerFunc(chat.ChatStream))))
 
@@ -76,6 +86,23 @@ func main() {
 
 	log.Println("listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", root))
+}
+
+// envInt reads an integer env var, returning def when unset or unparseable, so a
+// malformed override falls back to a safe default rather than failing to boot.
+func envInt(name string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(name)); err == nil {
+		return v
+	}
+	return def
+}
+
+// envFloat reads a float env var, returning def when unset or unparseable.
+func envFloat(name string, def float64) float64 {
+	if v, err := strconv.ParseFloat(os.Getenv(name), 64); err == nil {
+		return v
+	}
+	return def
 }
 
 // parseAPIKeys turns a comma-separated API_KEYS value into a set of valid keys.

@@ -193,6 +193,8 @@ cd inference-gateway
 export AWS_REGION=us-east-1                                            # region where Bedrock model access is enabled
 export API_KEYS=testkey                                               # comma-separated valid keys
 export BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0    # optional; this is the default
+export RATE_LIMIT_RPS=2                                               # optional; per-key refill rate (req/s), default 2
+export RATE_LIMIT_BURST=5                                             # optional; per-key bucket size, default 5
 
 # 3. Run the service. It reads AWS credentials from your environment / ~/.aws
 #    and listens on :8080.

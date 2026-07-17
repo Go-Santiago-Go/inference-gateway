@@ -1,7 +1,9 @@
 package middleware
 
 import (
+	"math"
 	"net/http"
+	"strconv"
 	"sync"
 
 	"golang.org/x/time/rate"
@@ -27,12 +29,19 @@ func RateLimit(rps rate.Limit, burst int) func(http.Handler) http.Handler {
 			// separate bucket.  The stored value is any, hence the assertion.
 			lim, _ := limiters.LoadOrStore(key, rate.NewLimiter(rps, burst))
 
-			// Allow consumes a token without blocking. An empty bucket rejects
-			// with 429 and returns before next, so a throttled request never
-			// reaches Bedrock. Retry-After is a fixed hint; a Reserve-based
-			// exact delay is deferred as a refinement.
-			if !lim.(*rate.Limiter).Allow() {
-				w.Header().Set("Retry-After", "1")
+			// Reserve claims the next token and reports how long until it would be
+			// available. A zero delay means a token was free, so the request
+			// proceeds. A positive delay means an empty bucket: cancel the
+			// reservation (the request is rejected, not queued) and reject with a
+			// 429 before next, so a throttled request never reaches Bedrock. The
+			// delay becomes an honest Retry-After the client can count down.
+			res := lim.(*rate.Limiter).Reserve()
+			if delay := res.Delay(); delay > 0 {
+				res.Cancel()
+				// Round up to whole seconds, floored at 1, since Retry-After is an
+				// integer count of seconds and 0 would tell the client to retry now.
+				seconds := max(int(math.Ceil(delay.Seconds())), 1)
+				w.Header().Set("Retry-After", strconv.Itoa(seconds))
 				http.Error(w, "rate limited", http.StatusTooManyRequests)
 				return
 			}
