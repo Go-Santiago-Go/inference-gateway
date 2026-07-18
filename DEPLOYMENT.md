@@ -152,6 +152,64 @@ should see tokens stream in, a working Stop button, and the per-request cost in 
 terraform -chdir=infra destroy    # removes the ECS service, ALB, CloudFront, and bucket
 ```
 
+**Budget 25 to 40 minutes, and expect to run it more than once.** Teardown is slower than deploy, and
+two resources dominate:
+
+- **The ECS Express service** takes 20+ minutes, because deleting it also unwinds the load balancer,
+  listeners, and security groups that Express Mode created for you. The Terraform provider waits 20
+  minutes for the service to reach `INACTIVE` and then gives up with:
+
+  ```
+  Error: deleting ECS (Elastic Container) Express Gateway Service
+  Cause: While waiting, timeout while waiting for state to become 'INACTIVE'
+  (last state: 'DRAINING', timeout: 20m0s)
+  ```
+
+  **This is a provider timeout, not a failure.** AWS is still deleting; Terraform just stopped
+  watching. Confirm with
+  `aws ecs describe-services --cluster default --services inference-gateway --query 'services[0].status'`
+  and simply run `terraform destroy` again. The second run picks up where the first stopped.
+
+- **CloudFront** must be disabled before it can be deleted, which the provider does for you, but the
+  disable-then-delete cycle takes several minutes on its own.
+
+**The load balancer outlives `terraform destroy`, and you have to delete it yourself.** This is the
+one that will quietly bill you. Express Mode creates a shared ALB (it consolidates up to 25 services
+behind one) and tags it `AmazonECSManaged`. Because *ECS* owns it rather than your Terraform, deleting
+the service does not delete the load balancer, and your state file has no record it ever existed. No
+number of `terraform destroy` runs will remove it. Left alone it costs roughly $16 to $24 a month.
+
+Verify you are actually at zero rather than trusting the command's exit code:
+
+```bash
+terraform -chdir=infra state list                                                            # expect empty
+aws ecs list-services --cluster default                                                      # expect empty
+aws elbv2 describe-load-balancers --query 'LoadBalancers[].LoadBalancerName' --output text   # expect empty
+aws elbv2 describe-target-groups  --query 'TargetGroups[].TargetGroupName'  --output text    # expect empty
+aws cloudfront list-distributions --query 'DistributionList.Items[].Id'     --output text    # expect None
+```
+
+If a load balancer is still listed once every ECS service is gone, it is orphaned. Delete it and the
+target groups it leaves behind:
+
+```bash
+ALB=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+aws elbv2 delete-load-balancer --load-balancer-arn "$ALB"
+
+# Target groups cannot be deleted until the listener is fully gone, which lags by
+# a minute or two. Retry until they delete cleanly.
+for TG in $(aws elbv2 describe-target-groups --query 'TargetGroups[].TargetGroupArn' --output text); do
+  aws elbv2 delete-target-group --target-group-arn "$TG"
+done
+```
+
+Do this only when no ECS service remains: if you plan to redeploy shortly, Express Mode will reuse the
+existing load balancer instead of provisioning a new one.
+
+This slow, imprecise teardown is the trade-off for the managed abstraction: Express Mode gives you a
+Fargate service, an ALB, TLS, and autoscaling from a single resource, and in exchange you do not
+control the lifecycle of the things it created for you.
+
 Leave the bootstrap stack up: ECR and the CI role are free, and keeping them means CI can push images
 at any time and your pushed image survives for the next deploy. If you want everything gone,
 `terraform destroy` in `infra/bootstrap` too, though note that destroying the OIDC provider will break
