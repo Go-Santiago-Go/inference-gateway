@@ -1,6 +1,7 @@
 # infer-gateway
 
 [![ci](https://github.com/Go-Santiago-Go/inference-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Go-Santiago-Go/inference-gateway/actions/workflows/ci.yml)
+[![deploy](https://github.com/Go-Santiago-Go/inference-gateway/actions/workflows/deploy.yml/badge.svg)](https://github.com/Go-Santiago-Go/inference-gateway/actions/workflows/deploy.yml)
 
 **A production-shaped inference gateway in Go that sits in front of AWS Bedrock.** It adds the
 operations layer that raw Bedrock lacks: Server-Sent Events token streaming, per-key API-key auth,
