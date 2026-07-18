@@ -1,0 +1,20 @@
+# Local provider plugins and cache
+.terraform/
+
+# State files may contain sensitive values; never commit them
+*.tfstate
+*.tfstate.*
+
+# Variable files that may hold secrets
+*.tfvars
+*.tfvars.json
+
+# Crash logs and CLI overrides
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc

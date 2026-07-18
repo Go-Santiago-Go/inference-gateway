@@ -112,8 +112,13 @@ for a small image and attack surface, and GitHub Actions builds and pushes it to
 long-lived SSE stream mid-answer, so it must be raised before relying on it. Second, the token-bucket
 limiters live in the task's memory, which is only globally correct while a **single task** serves
 traffic; scaling out to several tasks would split each key's budget across them, so multi-task
-correctness needs shared state in Redis and is a stretch item, not the MVP. This all lands in Phases
-8 to 9; the [Status](#status) section is the source of truth for what is actually built.
+correctness needs shared state in Redis and is a stretch item, not the MVP.
+
+The Terraform for this lives in [`infra/`](./infra). As of Phase 8 it provisions the ECR repository,
+the task and execution IAM roles (least-privilege: the task role invokes Bedrock, the execution role
+pulls the image and reads the API keys from SSM), and the API keys as an SSM `SecureString`. The
+compute (the ECS Express Mode service and the load balancer above) lands in Phase 9; the
+[Status](#status) section is the source of truth for what is actually built.
 
 ## Design decisions
 
@@ -160,8 +165,11 @@ end to end.
   button backed by `AbortController`, the request lifecycle modeled as a discriminated union with
   clean `401`/`429` states, per-request and cumulative-conversation cost, multi-turn conversations,
   Markdown rendering, and a dark/light theme, all with WCAG-AA-verified contrast (Phase 7)
-- [ ] Containerized with a distroless image, Terraform, and CI/CD to ECR, deployed on ECS Express
-  Mode with a live public URL (Phases 8 to 9)
+- [x] Terraform for the AWS resources the deploy needs: an ECR repository, the task and execution IAM
+  roles with least-privilege policies (scoped Bedrock invoke, scoped SSM read), and the API keys in an
+  SSM `SecureString`; `terraform apply`/`destroy` are clean and idempotent (Phase 8)
+- [ ] Containerized with a distroless image and CI/CD to ECR, deployed on ECS Express Mode with a live
+  public URL (Phase 9)
 
 ## Stack
 
