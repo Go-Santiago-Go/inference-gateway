@@ -28,7 +28,17 @@ resource "aws_iam_role_policy" "task_bedrock" {
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream", # the ConverseStream path
       ]
-      Resource = "arn:aws:bedrock:us-east-1::foundation-model/*"
+      # The gateway fronts a cross-region inference profile (the "us." model ID
+      # prefix), so Bedrock routes each call to whichever US region has capacity.
+      # That needs permission on the profile itself AND on the foundation model in
+      # every region the profile can route to; granting only the local foundation
+      # model returns AccessDenied before the request ever reaches a model.
+      Resource = [
+        "arn:aws:bedrock:us-east-1:${data.aws_caller_identity.current.account_id}:inference-profile/*",
+        "arn:aws:bedrock:us-east-1::foundation-model/*",
+        "arn:aws:bedrock:us-east-2::foundation-model/*",
+        "arn:aws:bedrock:us-west-2::foundation-model/*",
+      ]
     }]
   })
 }

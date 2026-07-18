@@ -43,6 +43,14 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	stream, err := h.gen.GenerateStream(r.Context(), messages)
 	if err != nil {
+		// Log the upstream error but keep the client's message generic: the caller
+		// cannot act on a Bedrock fault, and the detail (model IDs, IAM failures)
+		// is operator information. Without this line a 502 is unattributable.
+		middleware.LoggerFromContext(r.Context()).Error("generation failed",
+			"err", err,
+			"model", h.model,
+			"stream", true,
+		)
 		// Must return: on error stream is nil, and ranging a nil channel blocks
 		// forever. This can still set a status because no frame has been sent.
 		http.Error(w, "generation failed", http.StatusBadGateway)
