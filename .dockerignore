@@ -1,0 +1,12 @@
+.git
+.github
+
+# The client is a separate static bundle; nothing here is needed to build the Go binary.
+client
+
+# Terraform state can contain secrets and must never enter a build context.
+infra/.terraform
+infra/*.tfstate*
+
+content
+*.md

@@ -4,11 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-This repo is **pre-implementation**: it contains planning docs only (`README.md`,
-`PROJECT3_BUILD_PLAN.md`, `UI_SPEC.md`, `infer-gateway-ui-mock.html`), no Go or web source, and is
-not yet a git repo. `PROJECT3_BUILD_PLAN.md` is the authoritative, phased spec (Phases 0–9); build in
-that order. **Phase 7 is the MVP cut line**; everything after is AWS deployment. `UI_SPEC.md` +
-`infer-gateway-ui-mock.html` are the behavioral and visual sources of truth for the Phase 7 client.
+Phases 0–8 are complete: the Go gateway, the React client, CI, and the Terraform for ECR and the IAM
+roles all exist and are committed. Phase 9 (deploy the gateway to ECS, host the client, capture live
+URLs) is in progress; the Dockerfile is built and verified locally against real Bedrock.
+
+`PROJECT3_BUILD_PLAN.md` is the authoritative, phased spec. **Phase 7 is the MVP cut line**;
+everything after is AWS deployment. `UI_SPEC.md` + `infer-gateway-ui-mock.html` are the behavioral
+and visual sources of truth for the client.
 
 `CLAUDE.local.md` holds the working style and teaching method for this repo and takes precedence for
 *how* to collaborate; this file covers *what* is being built.
@@ -49,8 +51,9 @@ Smoke-test the stream and the rate limiter:
 ```bash
 curl -N -X POST http://localhost:8080/v1/chat \
   -H "X-API-Key: testkey" -H "Content-Type: application/json" \
-  -d '{"prompt":"hi"}'
-hey -n 200 -c 20 -H "X-API-Key: testkey" -m POST -d '{"prompt":"hi"}' http://localhost:8080/v1/chat
+  -d '{"messages":[{"role":"user","content":"hi"}]}'
+hey -n 200 -c 20 -H "X-API-Key: testkey" -m POST \
+  -d '{"messages":[{"role":"user","content":"hi"}]}' http://localhost:8080/v1/chat
 ```
 
 CI (`.github/workflows/ci.yml`) runs `go build`/`go vet`/`go test`; a `client/` build job is added in

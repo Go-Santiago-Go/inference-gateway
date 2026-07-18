@@ -1,0 +1,45 @@
+name: deploy
+
+# Only build+push on merges to main (not on every PR), so branch builds do not
+# fill ECR. workflow_dispatch allows a manual run from the Actions tab.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least-privilege token permissions for this workflow:
+#   id-token: write -> allows requesting the OIDC token (omit it and the AWS
+#                      login step cannot get a token)
+#   contents: read  -> allows checking out the repo
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Exchange the GitHub OIDC token for temporary AWS credentials by assuming
+      # the CI role defined in infra/bootstrap/github_oidc.tf. No static key exists.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # docker login to ECR using those temporary creds; exposes the registry
+      # host as steps.ecr.outputs.registry for the build step below.
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tag the image twice: the git SHA (immutable, every image maps to an
+      # exact commit) and :latest (a moving convenience pointer).
+      - name: Build and push
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/inference-gateway"
+          docker build -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" .
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"

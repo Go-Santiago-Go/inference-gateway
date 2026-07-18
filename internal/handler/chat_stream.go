@@ -3,7 +3,6 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -76,7 +75,7 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 
 	// One structured line per request, the same fields as the non-streaming
 	// path; stream:true distinguishes the two endpoints in the logs.
-	slog.Info("generation",
+	middleware.LoggerFromContext(r.Context()).Info("generation",
 		"key", key,
 		"model", h.model,
 		"tokens_in", tokensIn,
