@@ -64,6 +64,13 @@ resource "aws_ecs_express_gateway_service" "gateway" {
       value = "us-east-1"
     }
 
+    # The hosted client's origin. Terraform resolves this after the distribution
+    # exists, so the allowlist never has to be filled in by hand.
+    environment {
+      name  = "CORS_ORIGINS"
+      value = "https://${aws_cloudfront_distribution.client.domain_name}"
+    }
+
     # API keys are injected from SSM at task startup by the execution role, so
     # they never appear in the task definition, the image, or Terraform state.
     secret {
