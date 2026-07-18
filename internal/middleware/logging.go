@@ -5,12 +5,18 @@
 package middleware
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
 	"net/http"
 	"time"
 )
+
+// loggerID labels the request-scoped slog.Logger attached to the context by
+// Logging. Handlers read it back so every line they emit carries the same
+// request_id as the middleware's own line.
+const loggerID contextKey = "logger"
 
 type statusRecorder struct {
 	http.ResponseWriter
@@ -38,9 +44,14 @@ func Logging(next http.Handler) http.Handler {
 		// Measure latency across the handler: stamp before, log after.
 		start := time.Now()
 
+		// The logger goes into the context so the handler's own lines carry the
+		// same request_id, which is what makes the request line and the
+		// generation line joinable in a log query under concurrent load.
 		logger := slog.With("request_id", newRequestID())
+		ctx := context.WithValue(r.Context(), loggerID, logger)
+
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rec, r)
+		next.ServeHTTP(rec, r.WithContext(ctx))
 
 		logger.Info("request",
 			"method", r.Method,
@@ -49,6 +60,16 @@ func Logging(next http.Handler) http.Handler {
 			"latency_ms", time.Since(start).Milliseconds(),
 		)
 	})
+}
+
+// LoggerFromContext returns the request-scoped logger attached by Logging. It
+// falls back to slog.Default() so a handler called without the middleware (in a
+// unit test, say) still logs rather than panicking on a nil logger.
+func LoggerFromContext(ctx context.Context) *slog.Logger {
+	if logger, ok := ctx.Value(loggerID).(*slog.Logger); ok {
+		return logger
+	}
+	return slog.Default()
 }
 
 // newRequestID returns a random 16-byte hex string used to correlate every log

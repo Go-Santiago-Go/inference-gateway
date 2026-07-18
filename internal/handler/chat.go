@@ -5,7 +5,6 @@ package handler
 
 import (
 	"encoding/json"
-	"log/slog"
 	"net/http"
 	"time"
 
@@ -98,7 +97,7 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 
 	cost := meter.Cost(h.model, comp.TokensIn, comp.TokensOut)
 
-	slog.Info("generation",
+	middleware.LoggerFromContext(r.Context()).Info("generation",
 		"key", key,
 		"model", h.model,
 		"tokens_in", comp.TokensIn,

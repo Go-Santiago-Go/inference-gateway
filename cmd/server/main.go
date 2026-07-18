@@ -76,7 +76,10 @@ func main() {
 	chat := handler.New(gen, modelID)
 	mux.Handle("POST /v1/chat", auth(rateLimit(http.HandlerFunc(chat.ChatStream))))
 
-	cors := middleware.CORS("http://localhost:5173", "http://127.0.0.1:5173")
+	// Allowed browser origins are config, not code: the deployed client's origin is
+	// not known until it is hosted, and making this an env var means adding it is a
+	// task-definition change rather than an image rebuild. Defaults cover local dev.
+	cors := middleware.CORS(envList("CORS_ORIGINS", "http://localhost:5173", "http://127.0.0.1:5173")...)
 
 	// Compose the chain Logging -> CORS -> mux. Named root (not handler) to avoid
 	// shadowing the imported handler package. Logging is outermost so it wraps
@@ -103,6 +106,23 @@ func envFloat(name string, def float64) float64 {
 		return v
 	}
 	return def
+}
+
+// envList reads a comma-separated env var into a slice, returning def when the
+// variable is unset or contains no non-blank entries. An empty result would
+// silently disable every browser client, so falling back to def is the safer
+// failure mode for a malformed override.
+func envList(name string, def ...string) []string {
+	var out []string
+	for v := range strings.SplitSeq(os.Getenv(name), ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
 }
 
 // parseAPIKeys turns a comma-separated API_KEYS value into a set of valid keys.
