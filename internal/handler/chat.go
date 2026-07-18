@@ -90,6 +90,13 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	comp, err := h.gen.Generate(r.Context(), messages) // cancellation propagates
 	if err != nil {
+		// Log the upstream error but keep the client's message generic: the caller
+		// cannot act on a Bedrock fault, and the detail (model IDs, IAM failures)
+		// is operator information. Without this line a 502 is unattributable.
+		middleware.LoggerFromContext(r.Context()).Error("generation failed",
+			"err", err,
+			"model", h.model,
+		)
 		http.Error(w, "generation failed", http.StatusBadGateway)
 		return
 	}
