@@ -3,15 +3,16 @@
 [![ci](https://github.com/Go-Santiago-Go/inference-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Go-Santiago-Go/inference-gateway/actions/workflows/ci.yml)
 [![deploy](https://github.com/Go-Santiago-Go/inference-gateway/actions/workflows/deploy.yml/badge.svg)](https://github.com/Go-Santiago-Go/inference-gateway/actions/workflows/deploy.yml)
 
-**A production-shaped inference gateway in Go that sits in front of AWS Bedrock.** It adds the
-operations layer that raw Bedrock lacks: Server-Sent Events token streaming, per-key API-key auth,
-per-key rate limiting, retries with backoff and jitter, and per-request token and cost accounting,
-all observable through structured `slog` logs.
+**A production-shaped inference gateway in Go that sits in front of AWS Bedrock.** I built it to add
+the operations layer that raw Bedrock lacks: Server-Sent Events token streaming, per-key API-key auth,
+per-key rate limiting, retries with backoff and jitter, and per-request token and cost accounting, all
+observable through structured `slog` logs.
 
-Bedrock is called behind a `Generator` interface and every cross-cutting concern lives in its own
-middleware, so the pipeline is unit tested with zero cloud access and the handler stays a thin piece
-of orchestration. A React and TypeScript client streams from the gateway in the browser and makes
-each of those features visible on screen. Built to be consumed by a human, a browser, or an agent.
+I call Bedrock behind a `Generator` interface and keep every cross-cutting concern in its own
+middleware, so I can unit test the pipeline with zero cloud access and the handler stays a thin piece
+of orchestration. I also wrote a React and TypeScript client that streams from the gateway in the
+browser, so each of those features is visible on screen rather than only in a log line. Built to be
+consumed by a human, a browser, or an agent.
 
 One streaming endpoint, plus probes:
 
@@ -20,12 +21,12 @@ One streaming endpoint, plus probes:
   API key, rate limited per key, and retried on transient failures.
 - `GET /health` and `GET /ready` for liveness and readiness.
 
-> **Project status:** built local-first, phase by phase, and **deployed to AWS and verified end to
-> end.** `terraform apply` provisions the gateway on ECS Express Mode and the client on S3 behind
-> CloudFront, and against the live URLs a browser streams a Bedrock answer token by token, Stop
-> cancels it mid-stream, an invalid key returns `401`, and a burst returns `429` with an accurate
-> `Retry-After`. The stack is torn down with `terraform destroy` after each session to avoid cost, so
-> the URLs are regenerated per deploy rather than kept always-on; see
+> **Project status:** I built this local-first, phase by phase, then **deployed it to AWS and verified
+> it end to end.** `terraform apply` provisions the gateway on ECS Express Mode and the client on S3
+> behind CloudFront. Against the live URLs I confirmed a browser streams a Bedrock answer token by
+> token, Stop cancels it mid-stream, an invalid key returns `401`, and a burst returns `429` with an
+> accurate `Retry-After`. I tear the stack down with `terraform destroy` after each session rather than
+> paying to leave it idle, so the URLs are regenerated per deploy instead of kept always-on. See
 > [DEPLOYMENT.md](DEPLOYMENT.md) to stand it up in your own account.
 
 ## Architecture
@@ -42,29 +43,29 @@ flowchart LR
     G -.->|"slog JSON: request_id, key, tokens, cost, ms"| L[("CloudWatch")]
 ```
 
-Every request flows through a chain of composable middleware. Cross-cutting concerns (CORS, auth,
+I route every request through a chain of composable middleware. Cross-cutting concerns (CORS, auth,
 rate limiting, logging, metering) each wrap the next, so the handler stays a thin piece of
-orchestration and each concern is testable in isolation. The Bedrock client sits behind a Go
-interface, so handlers can be tested with a fake and models swapped without touching handler code.
+orchestration and I can test each concern in isolation. I put the Bedrock client behind a Go
+interface, so I can test handlers against a fake and swap models without touching handler code.
 
 **Streaming without burning tokens.** `POST /v1/chat` relays Bedrock `ConverseStream` events onto a
 channel, and the handler writes each as a `data:` frame flushed immediately with `http.Flusher`, then
-emits a final `event: usage` frame. The request context threads from the handler through the
+emits a final `event: usage` frame. I thread the request context from the handler through the
 `Generator` into the SDK call, so a client disconnect (or the client's Stop button) cancels the
 in-flight Bedrock call and the retry loop instead of paying for tokens nobody reads.
 
 ### Deployment (AWS)
 
-The container runs on **Amazon ECS Express Mode on Fargate**: from an image plus three IAM roles,
+I run the container on **Amazon ECS Express Mode on Fargate**: from an image plus three IAM roles,
 Express Mode provisions the Fargate service, an internet-facing load balancer with TLS, autoscaling,
 health checks, and the security-group wiring between the load balancer and the task, and hands back a
 public `*.ecs.<region>.on.aws` URL. There is no database and no data tier: rate-limit state lives in
 the task's memory, so the request path is just the load balancer and the app.
 
-The React client is a static bundle, so it is served separately: a private S3 bucket fronted by
+The React client is a static bundle, so I serve it separately: a private S3 bucket fronted by
 CloudFront, reachable only through the distribution via an Origin Access Control. The browser
 therefore talks to two origins, CloudFront for the app and the load balancer for the API, which is
-why the gateway's CORS allowlist is wired to the distribution's domain at apply time.
+why I wire the gateway's CORS allowlist to the distribution's domain at apply time.
 
 ```mermaid
 flowchart TB
@@ -171,10 +172,10 @@ building and uploading the client, and teardown), see [DEPLOYMENT.md](DEPLOYMENT
 
 ## Design decisions
 
-Every choice below optimizes for one constraint: the simplest component that satisfies the
+I optimized every choice below for one constraint: the simplest component that satisfies the
 requirement, reaching for managed or heavyweight infrastructure only where the workload genuinely
-demands it. The decisions that are not load-bearing sit behind interfaces, so they can change later
-without disturbing the core.
+demands it. I put the decisions that are not load-bearing behind interfaces, so I can change them
+later without disturbing the core.
 
 | Decision | Choice | Why | Also considered |
 |---|---|---|---|
@@ -189,14 +190,14 @@ without disturbing the core.
 | Compute | ECS Express Mode on Fargate | Managed networking, load balancing, and scaling from an image; App Runner is closed to new customers | Full ECS Fargate |
 
 The pattern under all of it is **dependency inversion at the boundaries**: the request path depends on
-a `Generator` interface, and the concrete Bedrock client is plugged in at `main`. That is what lets
-the whole pipeline be tested with a fake generator and no cloud, and lets the model or provider be
-swapped without touching handler code.
+a `Generator` interface, and I plug the concrete Bedrock client in at `main`. That is what lets me
+test the whole pipeline with a fake generator and no cloud, and swap the model or provider without
+touching handler code.
 
 ## Status
 
-Built local-first, phase by phase. Boxes below are checked only where the work is done and verified
-end to end.
+I built this local-first, phase by phase. I check a box below only where the work is done and
+verified end to end.
 
 - [x] HTTP server on `net/http` (Go 1.22 routing), `GET /health` and `GET /ready`, one structured
   `slog` JSON line per request, and CORS with preflight handling (Phase 1)
@@ -234,11 +235,11 @@ end to end.
 
 ## Local development
 
-The fastest path is local: the Go service runs natively and talks to Bedrock, so no local database or
-container is required to see the full request path. It does call Bedrock, so the machine running it
-needs AWS credentials with **Bedrock access** and a Converse-stream model enabled in the region.
+The fastest path is local. The Go service runs natively and talks to Bedrock, so you need no local
+database and no container to see the full request path. It does call Bedrock, so the machine running
+it needs AWS credentials with **Bedrock access** and a Converse-stream model enabled in the region.
 
-**Prerequisites.** [Go 1.22+](https://go.dev/doc/install), [Docker](https://docs.docker.com/get-docker/),
+**Prerequisites.** [Go 1.26+](https://go.dev/doc/install), [Docker](https://docs.docker.com/get-docker/),
 and AWS credentials configured (`aws configure`) with
 [model access](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html) enabled for a
 Claude model in your region.
@@ -429,7 +430,7 @@ npm test        # SSE frame-parser unit tests (vitest)
 
 ## Performance
 
-The gateway's own serving overhead is measured with Go benchmarks against the fake `Generator`, so no
+I measure the gateway's own serving overhead with Go benchmarks against the fake `Generator`, so no
 Bedrock call and no network are involved and the numbers reflect the pipeline's cost, not the model's
 latency. On an 8-core i9-9900K:
 
@@ -448,23 +449,15 @@ contention a mutex-guarded map would add.
 go test -run '^$' -bench . -benchmem ./internal/handler ./internal/middleware
 ```
 
-## Writeups
-
-Build notes and explanations for the decisions behind this project are captured per phase in
-[`content/`](./content) and posted on LinkedIn:
-[christian-santiago-dev](https://www.linkedin.com/in/christian-santiago-dev/).
-
 ## Related projects
 
-Part of a portfolio arc that moves from building an AI capability, to composing it, to operating it.
+This is part of a portfolio arc that moves from building an AI capability to operating it.
 
-- [go-rag-api (Citely)](https://github.com/Go-Santiago-Go/go-rag-api): a Go RAG service on Bedrock,
-  deployed on AWS. Proves the core AI capability.
-- doc-agent (planned): a Strands agent that consumes Citely's `/query` as a tool, to demonstrate
-  composing capabilities into a system.
-- infer-gateway (this repo): the serving, scaling, and observability layer in front of inference,
-  with a typed client that exercises it. Proves operating inference like a production engineer.
+- [rag-api](https://github.com/Go-Santiago-Go/rag-api): a Go RAG service on Bedrock with pgvector,
+  deployed on AWS behind a three-tier VPC. Proves I can build the core AI capability.
+- **infer-gateway (this repo)**: the serving, scaling, and observability layer in front of inference,
+  with a typed client that exercises it. Proves I can operate inference like a production engineer.
 
-Concrete tie-in: Citely's generation call could itself sit behind this gateway, so the same Bedrock
-traffic that powers the RAG service would be rate-limited, retried, and cost-metered by this
+Concrete tie-in: `rag-api`'s generation call could itself sit behind this gateway, so the same Bedrock
+traffic powering the RAG service would be rate-limited, retried, and cost-metered by this
 infrastructure.
