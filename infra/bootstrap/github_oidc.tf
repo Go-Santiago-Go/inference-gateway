@@ -4,12 +4,28 @@
 # signed GitHub token for temporary AWS credentials via
 # sts:AssumeRoleWithWebIdentity. Nothing to leak, nothing to rotate.
 
-# The GitHub OIDC provider is an account-level singleton (one per issuer URL) and
-# already exists in this account, created by the go-rag-api stack. Reading it with
-# a data source avoids ownership conflicts and keeps `terraform destroy` here from
-# removing a provider that another project depends on.
+# The GitHub OIDC provider is an account-level singleton, one per issuer URL. A
+# fresh account has none and must create it; an account where another project
+# already did must reuse it, since creating a second one fails. create_oidc_provider
+# selects between the two, and reusing via a data source also keeps a destroy here
+# from removing a provider other stacks depend on.
+resource "aws_iam_openid_connect_provider" "github" {
+  count = var.create_oidc_provider ? 1 : 0
+
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+}
+
 data "aws_iam_openid_connect_provider" "github" {
+  count = var.create_oidc_provider ? 0 : 1
+
   url = "https://token.actions.githubusercontent.com"
+}
+
+# One place for the ARN so the trust policy does not care which branch produced it.
+locals {
+  github_oidc_arn = var.create_oidc_provider ? one(aws_iam_openid_connect_provider.github[*].arn) : one(data.aws_iam_openid_connect_provider.github[*].arn)
 }
 
 # Trust policy: WHO may assume the CI role.
@@ -19,7 +35,7 @@ data "aws_iam_policy_document" "github_assume" {
 
     principals {
       type        = "Federated"
-      identifiers = [data.aws_iam_openid_connect_provider.github.arn]
+      identifiers = [local.github_oidc_arn]
     }
 
     # The token's audience must be STS.

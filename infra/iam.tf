@@ -34,8 +34,8 @@ resource "aws_iam_role_policy" "task_bedrock" {
       # every region the profile can route to; granting only the local foundation
       # model returns AccessDenied before the request ever reaches a model.
       Resource = [
-        "arn:aws:bedrock:us-east-1:${data.aws_caller_identity.current.account_id}:inference-profile/*",
-        "arn:aws:bedrock:us-east-1::foundation-model/*",
+        "arn:aws:bedrock:${var.aws_region}:${data.aws_caller_identity.current.account_id}:inference-profile/*",
+        "arn:aws:bedrock:${var.aws_region}::foundation-model/*",
         "arn:aws:bedrock:us-east-2::foundation-model/*",
         "arn:aws:bedrock:us-west-2::foundation-model/*",
       ]
@@ -76,7 +76,7 @@ resource "aws_iam_role_policy" "execution_ssm" {
     Statement = [{
       Effect   = "Allow"
       Action   = "ssm:GetParameters"
-      Resource = "arn:aws:ssm:us-east-1:${data.aws_caller_identity.current.account_id}:parameter/inference-gateway/api-keys"
+      Resource = aws_ssm_parameter.api_keys.arn
     }]
   })
 }

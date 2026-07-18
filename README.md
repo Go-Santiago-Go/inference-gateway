@@ -20,12 +20,13 @@ One streaming endpoint, plus probes:
   API key, rate limited per key, and retried on transient failures.
 - `GET /health` and `GET /ready` for liveness and readiness.
 
-> **Project status:** built local-first, phase by phase. **Phases 1 to 7 are done and verified end to
-> end** (server, non-streaming Converse, per-key auth, SSE streaming, per-key rate limiting, retries
-> with backoff and jitter, and the React + TypeScript client): the full request path runs locally,
-> streams into a browser, and is covered by tests that touch no AWS. The AWS deploy (Phases 8 to 9)
-> follows. This README describes the full target system, and the [Status](#status) section marks
-> exactly what runs today. Nothing is deployed yet, so there is no always-on URL to bill overnight.
+> **Project status:** built local-first, phase by phase, and **deployed to AWS and verified end to
+> end.** `terraform apply` provisions the gateway on ECS Express Mode and the client on S3 behind
+> CloudFront, and against the live URLs a browser streams a Bedrock answer token by token, Stop
+> cancels it mid-stream, an invalid key returns `401`, and a burst returns `429` with an accurate
+> `Retry-After`. The stack is torn down with `terraform destroy` after each session to avoid cost, so
+> the URLs are regenerated per deploy rather than kept always-on; see
+> [DEPLOYMENT.md](DEPLOYMENT.md) to stand it up in your own account.
 
 ## Architecture
 
@@ -52,17 +53,28 @@ emits a final `event: usage` frame. The request context threads from the handler
 `Generator` into the SDK call, so a client disconnect (or the client's Stop button) cancels the
 in-flight Bedrock call and the retry loop instead of paying for tokens nobody reads.
 
-### Deployment (AWS) · planned
+### Deployment (AWS)
 
-The container runs on **Amazon ECS Express Mode on Fargate**: from an image plus a few IAM roles,
-Express Mode provisions the Fargate service, an internet-facing load balancer with TLS, health
-checks, and the security-group wiring between the load balancer and the task, and hands back a public
-`*.ecs.<region>.on.aws` URL. There is no database and no data tier: rate-limit state lives in the
-task's memory, so the request path is just the load balancer and the app.
+The container runs on **Amazon ECS Express Mode on Fargate**: from an image plus three IAM roles,
+Express Mode provisions the Fargate service, an internet-facing load balancer with TLS, autoscaling,
+health checks, and the security-group wiring between the load balancer and the task, and hands back a
+public `*.ecs.<region>.on.aws` URL. There is no database and no data tier: rate-limit state lives in
+the task's memory, so the request path is just the load balancer and the app.
+
+The React client is a static bundle, so it is served separately: a private S3 bucket fronted by
+CloudFront, reachable only through the distribution via an Origin Access Control. The browser
+therefore talks to two origins, CloudFront for the app and the load balancer for the API, which is
+why the gateway's CORS allowlist is wired to the distribution's domain at apply time.
 
 ```mermaid
 flowchart TB
-    user(["Client · Browser · Agent · Internet"])
+    user(["Browser · curl · Agent · Internet"])
+
+    subgraph edge["🌍  EDGE · static app"]
+        direction LR
+        cf(["CloudFront<br/>TLS · OAC"])
+        s3[("S3 bucket<br/>private · React bundle")]
+    end
 
     subgraph vpc["Amazon VPC · Region us-east-1"]
         direction TB
@@ -70,7 +82,7 @@ flowchart TB
 
         subgraph web["🌐  PUBLIC SUBNETS"]
             direction TB
-            alb(["Application Load Balancer<br/>internet-facing · TLS<br/>idle timeout raised for SSE"])
+            alb(["Application Load Balancer<br/>internet-facing · TLS"])
             task["ECS Fargate task<br/>infer-gateway :8080<br/>single task · in-memory rate limits"]
         end
     end
@@ -79,47 +91,83 @@ flowchart TB
         direction LR
         bedrock["Amazon Bedrock<br/>Converse · ConverseStream"]
         ecr[("Amazon ECR")]
+        ssm["SSM Parameter Store<br/>API keys · SecureString"]
         cw["CloudWatch Logs<br/>slog JSON per request"]
     end
 
-    user ==>|"HTTPS 443"| igw
+    user ==>|"HTTPS · load the app"| cf
+    cf --> s3
+    user ==>|"HTTPS · POST /v1/chat"| igw
     igw ==>|"443"| alb
     alb ==>|"8080 · SSE"| task
     task -.->|"ConverseStream"| bedrock
     task -.->|"pull image"| ecr
+    task -.->|"API keys at startup"| ssm
     task -.->|"structured logs"| cw
 
     classDef ext fill:#232f3e,stroke:#ff9900,color:#ffffff;
     classDef net fill:#e7f0fb,stroke:#1a73e8,color:#0b3d91;
     classDef compute fill:#fdecd2,stroke:#ff9900,color:#7a4f01;
-    class bedrock,ecr,cw ext;
-    class igw,alb net;
+    classDef store fill:#e7f4ea,stroke:#2e7d32,color:#1b5e20;
+    class bedrock,ecr,cw,ssm ext;
+    class igw,alb,cf net;
     class task compute;
+    class s3 store;
 
     style vpc fill:#f6f2fb,stroke:#7d3ac1,stroke-width:2px,color:#4a1d7a;
     style web fill:#eaf6ea,stroke:#2e7d32,stroke-width:3px,color:#1b5e20;
+    style edge fill:#fff6e5,stroke:#ff9900,stroke-width:2px,color:#7a4f01;
     style svc fill:#fbfbfb,stroke:#bbbbbb,stroke-dasharray:2 2,color:#444444;
 
-    linkStyle 0,1,2 stroke:#ff9900,stroke-width:2px;
+    linkStyle 0,2,3,4 stroke:#ff9900,stroke-width:2px;
 ```
 
-The orange path traces a request in: **Client → Internet Gateway → Application Load Balancer → ECS
-task**. The dashed lines are the task's outbound calls: Bedrock for inference, ECR for the image at
-launch, and CloudWatch for the structured logs. A multi-stage Docker build ships a distroless binary
-for a small image and attack surface, and GitHub Actions builds and pushes it to ECR over GitHub OIDC
-(keyless CI/CD).
+The orange paths are the two things a browser does: **load the app** from CloudFront, then **call the
+API** through the Internet Gateway and load balancer into the ECS task. The dashed lines are the
+task's outbound calls: Bedrock for inference, ECR for the image at launch, SSM for the API keys
+injected at startup, and CloudWatch for the structured logs. A multi-stage Docker build ships a
+distroless binary (8.6 MB compressed) for a small image and attack surface, and GitHub Actions builds
+and pushes it to ECR over GitHub OIDC, with no stored AWS credentials.
 
-**Two honest constraints.** First, the ALB idle timeout defaults to 60 seconds and would cut a
-long-lived SSE stream mid-answer, so it must be raised before relying on it. Second, the token-bucket
-limiters live in the task's memory, which is only globally correct while a **single task** serves
-traffic; scaling out to several tasks would split each key's budget across them, so multi-task
-correctness needs shared state in Redis and is a stretch item, not the MVP.
+**Three honest constraints.** First, the ALB idle timeout is 60 seconds and Express Mode does not
+expose it as a tunable. In practice streams finish in one to two seconds, and it is an *idle* timer
+that resets on each byte, so it is never approached; a model that stalled longer than 60 seconds
+before its first token would need a heartbeat comment frame, which is a stretch item rather than
+something built. Second, the token-bucket limiters live in the task's memory, which is only globally
+correct while a **single task** serves traffic; scaling out would split each key's budget across
+tasks, so multi-task correctness needs shared state in Redis. Third, Express Mode places the tasks in
+public subnets in order to give the load balancer a public URL; the tasks have public IPs but stay
+unreachable because their security group admits only the load balancer. Keeping them fully private
+would mean dropping to a hand-rolled `aws_ecs_service`.
 
-The Terraform for this lives in [`infra/`](./infra). As of Phase 8 it provisions the ECR repository,
-the task and execution IAM roles (least-privilege: the task role invokes Bedrock, the execution role
-pulls the image and reads the API keys from SSM), and the API keys as an SSM `SecureString`. The
-compute (the ECS Express Mode service and the load balancer above) lands in Phase 9; the
-[Status](#status) section is the source of truth for what is actually built.
+The `infra/` directory holds two Terraform stacks, split by lifetime:
+
+- **[`infra/bootstrap/`](./infra/bootstrap)** provisions the free, long-lived pieces: the ECR
+  repository and the GitHub OIDC CI role. Apply it once and leave it up, so CI can push images at any
+  time and images survive the app stack's teardown.
+- **[`infra/`](./infra)** provisions the billable app stack: the ECS Express service and its
+  infrastructure role, the task and execution roles, the API keys as an SSM `SecureString`, the
+  CloudWatch log group, and the S3 and CloudFront hosting for the client. It looks the ECR repository
+  up by name, so bootstrap must be applied first. This is the stack you destroy after each session.
+
+```bash
+# Once: the persistent stack (free: ECR repository + CI role)
+cd infra/bootstrap && terraform init && terraform apply
+
+# Each session: the billable app stack (about 10 to 15 min; Express Mode waits
+# for health checks, CloudFront takes a few minutes to deploy)
+cd infra && terraform init && terraform apply
+terraform output gateway_url   # the live API URL
+terraform output client_url    # the hosted client
+terraform destroy              # tear the app stack down when done
+```
+
+The only meaningful cost while up is the Express Mode load balancer (roughly $0.02 per hour);
+CloudFront and S3 fall inside the always-free tier at this scale, and there is no database. A
+`destroy` after each session keeps the bill at pennies.
+
+For a step by step clone and deploy walkthrough (Bedrock model access, both stacks, pushing an image,
+building and uploading the client, and teardown), see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Design decisions
 
@@ -169,8 +217,10 @@ end to end.
 - [x] Terraform for the AWS resources the deploy needs: an ECR repository, the task and execution IAM
   roles with least-privilege policies (scoped Bedrock invoke, scoped SSM read), and the API keys in an
   SSM `SecureString`; `terraform apply`/`destroy` are clean and idempotent (Phase 8)
-- [ ] Containerized with a distroless image and CI/CD to ECR, deployed on ECS Express Mode with a live
-  public URL (Phase 9)
+- [x] Containerized in a multi-stage build to a distroless image (8.6 MB compressed, runs as
+  `nonroot`), pushed to ECR by GitHub Actions over OIDC with no stored AWS credentials, and deployed
+  on ECS Express Mode with the client on S3 behind CloudFront. Verified against the live URLs:
+  streaming, Stop, `401`, and `429` with `Retry-After` (Phase 9)
 
 ## Stack
 

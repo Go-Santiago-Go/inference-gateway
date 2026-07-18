@@ -61,7 +61,7 @@ resource "aws_ecs_express_gateway_service" "gateway" {
 
     environment {
       name  = "AWS_REGION"
-      value = "us-east-1"
+      value = var.aws_region
     }
 
     # The hosted client's origin. Terraform resolves this after the distribution
@@ -71,11 +71,12 @@ resource "aws_ecs_express_gateway_service" "gateway" {
       value = "https://${aws_cloudfront_distribution.client.domain_name}"
     }
 
-    # API keys are injected from SSM at task startup by the execution role, so
-    # they never appear in the task definition, the image, or Terraform state.
+    # API keys are injected from SSM at task startup by the execution role, so the
+    # value never appears in the task definition or the image. Terraform state does
+    # hold it, which is why state stays local and gitignored here.
     secret {
       name       = "API_KEYS"
-      value_from = "arn:aws:ssm:us-east-1:${data.aws_caller_identity.current.account_id}:parameter/inference-gateway/api-keys"
+      value_from = aws_ssm_parameter.api_keys.arn
     }
   }
 
