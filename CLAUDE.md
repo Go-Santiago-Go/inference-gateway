@@ -4,9 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-Phases 0–8 are complete: the Go gateway, the React client, CI, and the Terraform for ECR and the IAM
-roles all exist and are committed. Phase 9 (deploy the gateway to ECS, host the client, capture live
-URLs) is in progress; the Dockerfile is built and verified locally against real Bedrock.
+Phases 0–9 are complete and committed: the Go gateway, the React client, CI, the Terraform for ECR
+and the IAM roles, and the ECS Express Mode deploy with the client on S3 behind CloudFront.
+
+Work now happening past the original plan, driven by a portfolio review that found the project scoped
+below a "gateway": Phase 10 (Prometheus `/metrics` plus a Grafana dashboard, both provisioned from
+files and run locally via `docker-compose.yml`) is built and verified against live Bedrock. Phase 11
+(a second provider behind the `Generator` interface, plus a router with fallback and a circuit
+breaker) is next and is what makes the name "gateway" accurate. `content/observability.md` holds the
+reasoning behind the metrics work.
 
 `PROJECT3_BUILD_PLAN.md` is the authoritative, phased spec. **Phase 7 is the MVP cut line**;
 everything after is AWS deployment. `UI_SPEC.md` + `infer-gateway-ui-mock.html` are the behavioral
@@ -32,6 +38,13 @@ go vet ./...
 go test ./...              # all tests
 go test ./internal/meter   # a single package
 go test -run TestCost ./internal/meter   # a single test
+```
+
+Local observability stack (gateway + Prometheus + Grafana, dashboard pre-provisioned):
+```bash
+docker compose up -d --build   # Grafana on :3000, Prometheus on :9090, gateway on :8080
+curl -s localhost:8080/metrics | grep '^gateway_'
+docker compose down -v
 ```
 
 Docker (the deployed artifact; multi-stage build to distroless):

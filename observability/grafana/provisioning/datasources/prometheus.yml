@@ -1,0 +1,19 @@
+# Grafana reads this at startup, so the Prometheus data source exists before
+# anyone opens the UI. The uid is pinned to "prometheus" because the checked-in
+# dashboard JSON references it by uid; a generated uid would break the panels on
+# a fresh container.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Matches the scrape interval, so Grafana's $__rate_interval never resolves
+      # shorter than the window a rate() needs to see two samples.
+      timeInterval: 5s

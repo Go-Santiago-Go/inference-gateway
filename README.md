@@ -5,8 +5,9 @@
 
 **A production-shaped inference gateway in Go that sits in front of AWS Bedrock.** I built it to add
 the operations layer that raw Bedrock lacks: Server-Sent Events token streaming, per-key API-key auth,
-per-key rate limiting, retries with backoff and jitter, and per-request token and cost accounting, all
-observable through structured `slog` logs.
+per-key rate limiting, retries with backoff and jitter, and per-request token and cost accounting,
+observable through both structured `slog` logs and a Prometheus metrics endpoint with a checked-in
+Grafana dashboard.
 
 I call Bedrock behind a `Generator` interface and keep every cross-cutting concern in its own
 middleware, so I can unit test the pipeline with zero cloud access and the handler stays a thin piece
@@ -20,6 +21,8 @@ One streaming endpoint, plus probes:
   event that carries the request's token counts, cost, and latency. The request is authenticated by
   API key, rate limited per key, and retried on transient failures.
 - `GET /health` and `GET /ready` for liveness and readiness.
+- `GET /metrics` exposes traffic, latency, time to first token, token throughput and metered spend in
+  the Prometheus exposition format.
 
 > **Project status:** I built this local-first, phase by phase, then **deployed it to AWS and verified
 > it end to end.** `terraform apply` provisions the gateway on ECS Express Mode and the client on S3
@@ -41,7 +44,13 @@ flowchart LR
     B -->|"token events"| G
     G -->|"SSE tokens + usage event"| U
     G -.->|"slog JSON: request_id, key, tokens, cost, ms"| L[("CloudWatch")]
+    P[("Prometheus")] -.->|"scrapes GET /metrics"| G
+    P --> D["Grafana dashboard"]
 ```
+
+The two dotted paths out of the gateway are deliberate and carry different data. Logs are per-event
+and carry caller identity; metrics are pre-aggregated and carry none. See
+[Observability](#observability).
 
 I route every request through a chain of composable middleware. Cross-cutting concerns (CORS, auth,
 rate limiting, logging, metering) each wrap the next, so the handler stays a thin piece of
@@ -188,6 +197,10 @@ later without disturbing the core.
 | Bedrock access | Behind a `Generator` interface | Handlers test against a fake with no AWS, and models swap without touching handler code | Call the SDK directly |
 | Cross-cutting concerns | Middleware chain | Auth, limits, metering, and logging each stay testable in isolation and the handler stays thin | Logic inside handlers |
 | Compute | ECS Express Mode on Fargate | Managed networking, load balancing, and scaling from an image; App Runner is closed to new customers | Full ECS Fargate |
+| Metrics alongside logs | Prometheus counters and histograms | Aggregating at write time answers "what is p95 right now" at constant cost; from logs the same question costs work proportional to traffic, and is slowest during an incident | Query the logs, CloudWatch EMF |
+| Latency distributions | Histogram, not Summary | Bucket counters sum across instances, so a fleet-wide p95 is computable; per-instance precomputed quantiles cannot be averaged | Prometheus `Summary` |
+| Per-key attribution | Logs only, never a metric label | Series count grows with the customer list and never shrinks, and `/metrics` is unauthenticated, so a key label would leak credentials to any scraper | `api_key` label on the cost counter |
+| Route label | Allowlist, unknown paths collapse to `other` | Labelling with the raw path lets any caller mint unbounded series, turning monitoring into a denial of service vector | Raw `r.URL.Path` |
 
 The pattern under all of it is **dependency inversion at the boundaries**: the request path depends on
 a `Generator` interface, and I plug the concrete Bedrock client in at `main`. That is what lets me
@@ -222,6 +235,10 @@ verified end to end.
   `nonroot`), pushed to ECR by GitHub Actions over OIDC with no stored AWS credentials, and deployed
   on ECS Express Mode with the client on S3 behind CloudFront. Verified against the live URLs:
   streaming, Stop, `401`, and `429` with `Retry-After` (Phase 9)
+- [x] Prometheus metrics on `GET /metrics` (traffic by status, request latency, time to first token,
+  token throughput, metered spend, open SSE streams) and a Grafana dashboard provisioned from JSON in
+  the repo, both running locally from one `docker compose up`. Verified end to end against live
+  Bedrock: both scrape targets healthy, and every panel query returning real data (Phase 10)
 
 ## Stack
 
@@ -230,6 +247,8 @@ verified end to end.
 - **Server-Sent Events** for token streaming, read on the client with `fetch` + `ReadableStream`.
 - **`golang.org/x/time/rate`** for the per-key token-bucket limiter.
 - **React + TypeScript (Vite)** for the client that exercises the gateway in a browser.
+- **Prometheus** (`client_golang`) for metrics and **Grafana** for the dashboard, both provisioned
+  from files in this repo and run locally with Docker Compose.
 - **Docker** to containerize, **Terraform** for infrastructure, **GitHub Actions** for CI/CD to ECR.
 - **ECS Express Mode on Fargate** to run it.
 
@@ -339,16 +358,21 @@ in the `usage` event and logged, so spend is attributable per caller:
 limiter per key in a `sync.Map`), so a burst is absorbed up to the bucket size and then requests
 settle to the sustained refill rate. A key whose bucket is empty is rejected with `429 Too Many
 Requests` and a `Retry-After` header, in middleware, before the request reaches Bedrock. Firing 100
-concurrent requests at a single key with a demo-tuned burst of 5 shows the limiter engaging exactly at
-the burst size:
+concurrent requests at a single key with a demo-tuned burst of 5 shows the limiter engaging at the
+burst size:
 
 ```
-95 429   ← rejected in middleware, never reached Bedrock
- 5 200   ← served
+94 429   ← rejected in middleware, never reached Bedrock
+ 6 200   ← served
 ```
 
-The rejected requests log `latency_ms: 0` because they short-circuit before the upstream call, so the
-limiter is a spending cap, not just a counter. The burst and rate are operational knobs; the demo
+Six rather than five get through because the bucket refills at 2/second while the burst is still
+arriving, so the exact split moves by one or two with timing; the shape is what matters.
+
+Every rejected request logs `latency_ms: 0` (all 94, verified in the container logs) because it
+short-circuits before the upstream call. That is what makes the limiter a **spending cap**, not just
+a counter: at the default 2 req/s refill, a single key cannot cost more than roughly **$10.50/day**
+against Haiku 4.5 pricing, no matter how hard it is driven. The burst and rate are operational knobs; the demo
 value is deliberately low to make the behavior visible and the load test near-free.
 
 **Retries.** Bedrock calls are wrapped in a retry loop that fires only on *transient* failures, the
@@ -391,6 +415,32 @@ operation is still idempotent from the client's point of view.
 Liveness and readiness probes for the load balancer and orchestrator. Both are open, outside the auth
 middleware, so they never require an API key.
 
+### `GET /metrics`
+
+The Prometheus exposition format: the gateway's own collectors plus the Go runtime and process
+collectors. I register it **above** the instrumented middleware chain rather than inside it, because
+a scrape every few seconds is Prometheus talking to the operator, not a caller consuming the API. It
+therefore needs no API key, does not count itself as gateway traffic, and does not emit a log line per
+scrape.
+
+```bash
+curl -s localhost:8080/metrics | grep '^gateway_'
+```
+
+```
+gateway_active_streams 0
+gateway_cost_usd_total{model="us.anthropic.claude-haiku-4-5-20251001-v1:0"} 6.3e-05
+gateway_http_requests_total{method="GET",route="/health",status="200"} 4
+gateway_http_requests_total{method="GET",route="other",status="404"} 1
+gateway_http_requests_total{method="POST",route="/v1/chat",status="200"} 1
+gateway_http_requests_total{method="POST",route="/v1/chat",status="401"} 1
+gateway_tokens_total{direction="input",model="us.anthropic.claude-haiku-4-5-20251001-v1:0"} 13
+gateway_tokens_total{direction="output",model="us.anthropic.claude-haiku-4-5-20251001-v1:0"} 10
+```
+
+That `route="other"` line is a request for `/wp-login.php`. Unrecognized paths collapse into a single
+series on purpose; see [Observability](#observability).
+
 ## Web client
 
 The gateway's features are invisible by default: streaming, cancellation, per-key auth, rate limiting,
@@ -428,21 +478,97 @@ npm run build   # type-checks and emits client/dist
 npm test        # SSE frame-parser unit tests (vitest)
 ```
 
+## Observability
+
+Two data paths out of the gateway, doing different jobs. **Structured `slog` lines** are per-event
+and carry caller identity, so they answer "what happened to request `9f2c`". **Prometheus metrics**
+are pre-aggregated and carry no identity at all, so they answer "what is p95 time to first token right
+now" at a cost that does not grow with traffic. Answering that second question from logs means
+parsing and sorting every line in the window, which gets slowest exactly during an incident.
+
+### Running the stack
+
+One command brings up the gateway, a Prometheus that scrapes it, and a Grafana with the dashboard
+already loaded. Nothing to click.
+
+```bash
+docker compose up -d --build
+
+# Grafana, dashboard pre-provisioned, anonymous viewer access, no login
+open http://localhost:3000
+
+# Prometheus query UI, useful for debugging an empty panel
+open http://localhost:9090
+
+docker compose down -v   # tear down, including the metrics volume
+```
+
+The gateway container reads AWS credentials from a read-only mount of `~/.aws`, so it calls real
+Bedrock. Compose sets a deliberately tight `RATE_LIMIT_RPS=2` so a handful of concurrent requests trip
+the limiter and the `429` panel has something to show without a load generator.
+
+### What is on the dashboard
+
+| Metric | Type | Labels | What it answers |
+|---|---|---|---|
+| `gateway_http_requests_total` | counter | `method`, `route`, `status` | Traffic rate, and every failure mode at once: `401` is auth, `429` is the limiter, `502` is Bedrock failing after retries |
+| `gateway_http_request_duration_seconds` | histogram | `method`, `route` | End-to-end latency including streaming the body, so buckets run to 60s |
+| `gateway_time_to_first_token_seconds` | histogram | `model` | What the user actually feels waiting on a streamed answer |
+| `gateway_tokens_total` | counter | `model`, `direction` | Token throughput, input and output split because they are priced differently |
+| `gateway_cost_usd_total` | counter | `model` | Metered spend; a counter, so `rate(...) * 3600` gives dollars per hour |
+| `gateway_generation_duration_seconds` | histogram | `model`, `stream` | Upstream model time only, separating Bedrock latency from gateway overhead |
+| `gateway_upstream_errors_total` | counter | `model`, `stream` | Calls that failed after the retry budget was spent, distinct from the `502` rate |
+| `gateway_active_streams` | gauge | none | SSE streams open right now; falls when a client disconnects |
+
+Two things are deliberately **absent**, and they are the decisions I would defend in a review:
+
+- **No API key label anywhere.** Prometheus stores one time series per distinct label combination, so
+  keying on caller identity grows the footprint with the customer list and never shrinks it, since a
+  dead series holds index memory until retention expires. Worse, `/metrics` is unauthenticated, so a
+  key label would write live credentials into a page any scraper can read. Per-key attribution stays
+  in the `slog` line, where a high-cardinality field costs nothing.
+- **No raw request path.** `internal/metrics.Route` collapses anything outside a fixed allowlist to
+  `other`. Labelling with `r.URL.Path` would let a scanner spraying random URLs choose my series
+  count, which turns a monitoring config into a denial of service vector.
+
+### Honest constraints
+
+- **The stack runs locally, not against the deployed ECS task.** Prometheus pulls, so it needs
+  reachability to each individual instance. The deployed gateway sits behind a load balancer, and
+  scraping that address would round-robin across tasks and sample one arbitrary task's counters as
+  though they were the fleet's. The real answers are ECS service discovery or Amazon Managed Service
+  for Prometheus. Both are real work that does not change what this demonstrates.
+- **`/metrics` is unauthenticated and on the main port.** In production it belongs on a separate admin
+  port the load balancer does not expose. One port keeps the Compose wiring simple, and the endpoint
+  exposes no caller data precisely because of the cardinality rule above.
+- **Percentiles are estimates**, interpolated from histogram buckets rather than computed from sorted
+  observations. Accurate enough for dashboards and alerting, and worth saying rather than quoting p95
+  as if it were measured directly.
+
+The full reasoning, including a PromQL reference for every panel, is in
+[`content/observability.md`](content/observability.md).
+
 ## Performance
 
 I measure the gateway's own serving overhead with Go benchmarks against the fake `Generator`, so no
 Bedrock call and no network are involved and the numbers reflect the pipeline's cost, not the model's
 latency. On an 8-core i9-9900K:
 
-| What | Overhead | Throughput |
+| What | Overhead | Under 16-way concurrency |
 |---|---|---|
-| Full middleware chain (logging → CORS → auth → rate limit → SSE handler → metering) | ~24 µs/request | ~40K req/s per core (~210K aggregate) |
-| Rate-limit middleware alone | ~160 ns/request | near-flat under concurrency (160 → 185 ns across 16 goroutines) |
+| Full middleware chain (logging → CORS → auth → rate limit → SSE handler → metering) | ~23 µs/request (~43K req/s single-threaded) | ~4.6 µs/request aggregate (~220K req/s) |
+| Rate-limit middleware alone | ~223 ns/request, 160 B and 3 allocs | ~182 ns/request aggregate, all load on one key |
 
 The full-chain figure is the gateway's *own* cost, so the takeaway is that the gateway is not the
-throughput bottleneck; real throughput is bound by Bedrock latency and concurrency. The near-flat
-rate-limiter number under concurrency is the payoff of the `sync.Map` read path, which avoids the lock
-contention a mutex-guarded map would add.
+throughput bottleneck; real throughput is bound by Bedrock latency and concurrency.
+
+The limiter number is worth reading carefully, because it is a smaller claim than it first looks.
+Both limiter benchmarks drive a **single** key, so all 16 goroutines share one `rate.Limiter`, and
+`Allow` takes that limiter's internal mutex on every call. Per-request cost therefore stays flat
+under concurrency (223 ns → 182 ns) rather than collapsing, but it does not scale linearly either:
+same-key traffic serializes on that one limiter by design, which is exactly what a per-key budget
+means. The `sync.Map` removes contention *between different keys*, and this benchmark does not
+exercise that, so the honest claim is "flat under same-key concurrency," not "lock-free."
 
 ```bash
 # reproduce (no AWS, no cost)

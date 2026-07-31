@@ -10,6 +10,7 @@ import (
 
 	"github.com/Go-Santiago-Go/inference-gateway/internal/bedrock"
 	"github.com/Go-Santiago-Go/inference-gateway/internal/meter"
+	"github.com/Go-Santiago-Go/inference-gateway/internal/metrics"
 	"github.com/Go-Santiago-Go/inference-gateway/internal/middleware"
 )
 
@@ -97,12 +98,14 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 			"err", err,
 			"model", h.model,
 		)
+		metrics.RecordUpstreamError(h.model, false)
 		http.Error(w, "generation failed", http.StatusBadGateway)
 		return
 	}
 	latency := time.Since(start)
 
 	cost := meter.Cost(h.model, comp.TokensIn, comp.TokensOut)
+	metrics.RecordGeneration(h.model, false, comp.TokensIn, comp.TokensOut, cost, latency)
 
 	middleware.LoggerFromContext(r.Context()).Info("generation",
 		"key", key,

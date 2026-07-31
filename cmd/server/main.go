@@ -19,6 +19,7 @@ import (
 
 	"github.com/Go-Santiago-Go/inference-gateway/internal/bedrock"
 	"github.com/Go-Santiago-Go/inference-gateway/internal/handler"
+	"github.com/Go-Santiago-Go/inference-gateway/internal/metrics"
 	"github.com/Go-Santiago-Go/inference-gateway/internal/middleware"
 )
 
@@ -81,14 +82,24 @@ func main() {
 	// task-definition change rather than an image rebuild. Defaults cover local dev.
 	cors := middleware.CORS(envList("CORS_ORIGINS", "http://localhost:5173", "http://127.0.0.1:5173")...)
 
-	// Compose the chain Logging -> CORS -> mux. Named root (not handler) to avoid
-	// shadowing the imported handler package. Logging is outermost so it wraps
-	// every request, including the preflight OPTIONS that CORS short-circuits, and
-	// so its latency measurement covers the whole chain.
-	root := middleware.Logging(cors(mux))
+	// Compose the chain Metrics -> Logging -> CORS -> mux. Named root (not
+	// handler) to avoid shadowing the imported handler package. Metrics and
+	// Logging are outermost so they wrap every request, including the preflight
+	// OPTIONS that CORS short-circuits, and so their latency measurements cover
+	// the whole chain rather than the handler alone.
+	root := middleware.Metrics(middleware.Logging(cors(mux)))
+
+	// /metrics is registered above the instrumented chain, not inside it. A scrape
+	// every few seconds is Prometheus talking to the operator, not a caller
+	// consuming the API: it must not need an API key, must not count itself as
+	// gateway traffic, and must not emit a log line per scrape. Everything else
+	// falls through to root.
+	top := http.NewServeMux()
+	top.Handle("GET /metrics", metrics.Handler())
+	top.Handle("/", root)
 
 	log.Println("listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", root))
+	log.Fatal(http.ListenAndServe(":8080", top))
 }
 
 // envInt reads an integer env var, returning def when unset or unparseable, so a
