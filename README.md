@@ -5,21 +5,24 @@
 
 **A production-shaped inference gateway in Go that sits in front of AWS Bedrock.** I built it to add
 the operations layer that raw Bedrock lacks: Server-Sent Events token streaming, per-key API-key auth,
-per-key rate limiting, retries with backoff and jitter, and per-request token and cost accounting,
-observable through both structured `slog` logs and a Prometheus metrics endpoint with a checked-in
-Grafana dashboard.
+per-key rate limiting, retries with backoff and jitter, multi-provider routing with circuit-broken
+fallback, and per-request token and cost accounting, observable through both structured `slog` logs
+and a Prometheus metrics endpoint with a checked-in Grafana dashboard.
 
-I call Bedrock behind a `Generator` interface and keep every cross-cutting concern in its own
-middleware, so I can unit test the pipeline with zero cloud access and the handler stays a thin piece
-of orchestration. I also wrote a React and TypeScript client that streams from the gateway in the
-browser, so each of those features is visible on screen rather than only in a log line. Built to be
-consumed by a human, a browser, or an agent.
+Every backend sits behind one `Generator` interface, and a router composed of those same interfaces
+fails over to a second provider when the primary breaks, so a Bedrock outage degrades to a local model
+instead of to an error. I keep every cross-cutting concern in its own middleware, so I can unit test
+the pipeline with zero cloud access and the handler stays a thin piece of orchestration. I also wrote
+a React and TypeScript client that streams from the gateway in the browser, so each of those features
+is visible on screen rather than only in a log line. Built to be consumed by a human, a browser, or an
+agent.
 
 One streaming endpoint, plus probes:
 
-- `POST /v1/chat` streams a Bedrock completion back token by token over SSE, ending with a `usage`
-  event that carries the request's token counts, cost, and latency. The request is authenticated by
-  API key, rate limited per key, and retried on transient failures.
+- `POST /v1/chat` streams a completion back token by token over SSE, ending with a `usage`
+  event that carries the request's token counts, cost, latency, and the model that served it. The
+  request is authenticated by API key, rate limited per key, retried on transient failures, and
+  failed over to a second provider if the primary's circuit is open.
 - `GET /health` and `GET /ready` for liveness and readiness.
 - `GET /metrics` exposes traffic, latency, time to first token, token throughput and metered spend in
   the Prometheus exposition format.
@@ -40,8 +43,11 @@ The service, end to end:
 flowchart LR
     U["React + TS client"] -->|"POST /v1/chat · X-API-Key"| M["CORS → auth → rate limit → meter"]
     M --> G["Go gateway"]
-    G -->|"ConverseStream + retry"| B["AWS Bedrock"]
+    G --> R{{"Router"}}
+    R -->|"1st · ConverseStream + retry"| B["AWS Bedrock"]
+    R -.->|"2nd · on failure or open circuit"| O["Ollama"]
     B -->|"token events"| G
+    O -.->|"token events"| G
     G -->|"SSE tokens + usage event"| U
     G -.->|"slog JSON: request_id, key, tokens, cost, ms"| L[("CloudWatch")]
     P[("Prometheus")] -.->|"scrapes GET /metrics"| G
@@ -54,8 +60,27 @@ and carry caller identity; metrics are pre-aggregated and carry none. See
 
 I route every request through a chain of composable middleware. Cross-cutting concerns (CORS, auth,
 rate limiting, logging, metering) each wrap the next, so the handler stays a thin piece of
-orchestration and I can test each concern in isolation. I put the Bedrock client behind a Go
-interface, so I can test handlers against a fake and swap models without touching handler code.
+orchestration and I can test each concern in isolation.
+
+**One interface, three implementations of it.** `provider.Generator` is the seam every backend sits
+behind, and it lives in its own package so no backend imports another. The Bedrock and Ollama clients
+implement it. So does `breaker.Breaker`, which wraps a backend and stops calling it after repeated
+failures. So does `router.Router`, which holds an ordered list of them and serves the first that
+succeeds. A `Generator` wrapping a `Generator` inside a `Generator` holding `Generator`s, and the
+handler still receives exactly one. `cmd/server/main.go` is the only file in the repo that names a
+concrete backend, so adding a provider is a wiring change and nothing else.
+
+**Failover covers the open, not the stream.** Once a stream is relaying, tokens have already reached
+the browser, and no second generation would continue the first. So a mid-completion failure ends the
+stream rather than silently switching providers and contradicting what the user already read. The
+retry loop inside the Bedrock client stops at the same boundary for the same reason.
+
+**Why a breaker on top of failover.** Failover alone still pays the failing backend's full timeout on
+every request, so an outage becomes sustained latency rather than fast degradation, and the struggling
+provider keeps receiving the traffic that is keeping it down. After five consecutive failures the
+breaker stops calling it for 30 seconds, then admits exactly one probe to test recovery. A cancelled
+request never counts as a failure, or a burst of users hitting Stop would trip the breaker and take a
+healthy provider out of service.
 
 **Streaming without burning tokens.** `POST /v1/chat` relays Bedrock `ConverseStream` events onto a
 channel, and the handler writes each as a `data:` frame flushed immediately with `http.Flusher`, then
@@ -195,6 +220,15 @@ later without disturbing the core.
 | Retries | Backoff + jitter, transient only | Retrying a `4xx` just wastes calls; jitter avoids a thundering herd on the backend | Retry everything, fixed backoff |
 | Retry ownership | Own loop, SDK retryer disabled | Two retryers nest to 9 calls per request on stacked schedules; one explicit loop keeps call counts predictable | Tune the SDK's `retry.Standard` |
 | Bedrock access | Behind a `Generator` interface | Handlers test against a fake with no AWS, and models swap without touching handler code | Call the SDK directly |
+| Interface location | Own package (`internal/provider`), not the Bedrock package | Go satisfies interfaces implicitly, so no backend needs to import another; only `main` names a concrete one | Leave `Generator` in `internal/bedrock` |
+| Multi-provider routing | Router that implements `Generator` itself | Adding a backend never touches handler code, and the router names no concrete provider | A provider switch inside the handler |
+| Fallback provider | Ollama, running locally | Free, needs no second API key, and anyone who clones the repo can run the whole failover demo | A second paid cloud vendor |
+| Ollama client | `net/http` + `encoding/json`, no SDK | The protocol is one POST and a JSON decode loop; a dependency costs more in churn than it saves | The official Ollama Go client |
+| Stream failover | Open only, never mid-completion | Tokens already reached the client, and a second generation would not continue the first | Reconnect and resume on a new backend |
+| Failure isolation | Circuit breaker per backend | Failover alone pays the dead provider's timeout on every request and keeps hammering it while it is down | Failover with no breaker |
+| Breaker cooldown | Computed on read, no timer | No goroutine per breaker and no shutdown path; the first caller after the cooldown becomes the probe | A `time.AfterFunc` per breaker |
+| Cancelled requests | Never count as backend failures | Otherwise a burst of users hitting Stop trips the breaker and takes a healthy provider offline | Count every non-nil error |
+| Cost attribution | Priced by the model that answered | With a router the model is a runtime fact; pricing a free fallback at the primary's rate invents spend | Price by the configured model |
 | Cross-cutting concerns | Middleware chain | Auth, limits, metering, and logging each stay testable in isolation and the handler stays thin | Logic inside handlers |
 | Compute | ECS Express Mode on Fargate | Managed networking, load balancing, and scaling from an image; App Runner is closed to new customers | Full ECS Fargate |
 | Metrics alongside logs | Prometheus counters and histograms | Aggregating at write time answers "what is p95 right now" at constant cost; from logs the same question costs work proportional to traffic, and is slowest during an incident | Query the logs, CloudWatch EMF |
@@ -203,9 +237,10 @@ later without disturbing the core.
 | Route label | Allowlist, unknown paths collapse to `other` | Labelling with the raw path lets any caller mint unbounded series, turning monitoring into a denial of service vector | Raw `r.URL.Path` |
 
 The pattern under all of it is **dependency inversion at the boundaries**: the request path depends on
-a `Generator` interface, and I plug the concrete Bedrock client in at `main`. That is what lets me
-test the whole pipeline with a fake generator and no cloud, and swap the model or provider without
-touching handler code.
+a `Generator` interface, and I plug the concrete backends in at `main`. That is what lets me test the
+whole pipeline with a fake generator and no cloud, and it is why the router and the circuit breaker
+could be added as two more implementations of the same interface rather than as edits scattered
+through the handler.
 
 ## Status
 
@@ -239,11 +274,16 @@ verified end to end.
   token throughput, metered spend, open SSE streams) and a Grafana dashboard provisioned from JSON in
   the repo, both running locally from one `docker compose up`. Verified end to end against live
   Bedrock: both scrape targets healthy, and every panel query returning real data (Phase 10)
+- [x] Multi-provider routing: `Generator` moved to its own package, a second backend (Ollama) behind
+  the same interface, an ordered router that implements `Generator` itself, and a per-backend circuit
+  breaker with a half-open probe. Cost and metrics are attributed to the model that actually answered,
+  and the dashboard shows the circuit tripping and traffic shifting between backends (Phase 11)
 
 ## Stack
 
 - **Go** for the service (standard library `net/http` 1.22 routing and `log/slog`, no framework).
 - **AWS Bedrock** for inference via the Converse and `ConverseStream` APIs.
+- **Ollama** as the fallback backend, called over plain HTTP with no SDK.
 - **Server-Sent Events** for token streaming, read on the client with `fetch` + `ReadableStream`.
 - **`golang.org/x/time/rate`** for the per-key token-bucket limiter.
 - **React + TypeScript (Vite)** for the client that exercises the gateway in a browser.
@@ -275,6 +315,12 @@ export BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0    # optiona
 export RATE_LIMIT_RPS=2                                               # optional; per-key refill rate (req/s), default 2
 export RATE_LIMIT_BURST=5                                             # optional; per-key bucket size, default 5
 
+# Fallback routing is opt-in. Unset OLLAMA_URL and the gateway runs single backend.
+export OLLAMA_URL=http://localhost:11434                              # optional; enables the fallback backend
+export OLLAMA_MODEL=llama3.2                                          # optional; default llama3.2
+export BREAKER_THRESHOLD=5                                            # optional; consecutive failures before a circuit opens
+export BREAKER_COOLDOWN_SECONDS=30                                    # optional; wait before admitting a probe
+
 # 3. Run the service. It reads AWS credentials from your environment / ~/.aws
 #    and listens on :8080.
 go run ./cmd/server
@@ -288,7 +334,7 @@ curl -N -X POST localhost:8080/v1/chat \
 # data:  how are you today
 # data: ?
 # event: usage
-# data: {"tokens_in":14,"tokens_out":10,"cost_usd":0.000064,"latency_ms":1667}
+# data: {"tokens_in":14,"tokens_out":10,"cost_usd":0.000064,"latency_ms":1667,"model":"us.anthropic.claude-haiku-4-5-20251001-v1:0"}
 ```
 
 **Run the web client too.** With the gateway running on `:8080`, start the client so you can watch
@@ -324,10 +370,11 @@ CI runs two jobs on every push and pull request: `go build`/`go vet`/`go test` f
 
 Streams a Bedrock completion back token by token over Server-Sent Events. The request is
 authenticated by the `X-API-Key` header against the set loaded from `API_KEYS`; an unknown or missing
-key is rejected with `401` in middleware, before any Bedrock call. The handler relays Bedrock
-`ConverseStream` events as `data:` frames, flushing each immediately, then emits a final
-`event: usage` frame carrying the request's token counts, cost, and latency, the same fields logged
-as one structured JSON line.
+key is rejected with `401` in middleware, before any backend call. The handler relays the backend's
+events as `data:` frames, flushing each immediately, then emits a final `event: usage` frame carrying
+the request's token counts, cost, latency, and the model that served it, the same fields logged as one
+structured JSON line. The `model` field is not decoration: with a router in front, which backend
+answered is a runtime fact, and it is what the cost was priced from.
 
 ```bash
 curl -N -X POST localhost:8080/v1/chat \
@@ -336,7 +383,7 @@ curl -N -X POST localhost:8080/v1/chat \
 # data: A token bucket ...
 # ...
 # event: usage
-# data: {"tokens_in":18,"tokens_out":64,"cost_usd":0.0021,"latency_ms":840}
+# data: {"tokens_in":18,"tokens_out":64,"cost_usd":0.0021,"latency_ms":840,"model":"us.anthropic.claude-haiku-4-5-20251001-v1:0"}
 ```
 
 Request body: `{ "messages": [{ "role": "user" | "assistant", "content": string }] }`. The gateway is
@@ -494,18 +541,47 @@ already loaded. Nothing to click.
 ```bash
 docker compose up -d --build
 
+# One time only: pull the fallback model into the Ollama volume (about 2 GB).
+docker compose exec ollama ollama pull llama3.2
+
 # Grafana, dashboard pre-provisioned, anonymous viewer access, no login
 open http://localhost:3000
 
 # Prometheus query UI, useful for debugging an empty panel
 open http://localhost:9090
 
-docker compose down -v   # tear down, including the metrics volume
+docker compose down -v   # tear down, including the metrics and model volumes
 ```
 
 The gateway container reads AWS credentials from a read-only mount of `~/.aws`, so it calls real
 Bedrock. Compose sets a deliberately tight `RATE_LIMIT_RPS=2` so a handful of concurrent requests trip
 the limiter and the `429` panel has something to show without a load generator.
+
+### Watching the failover happen
+
+The routing layer is easiest to believe when you break something on purpose. Point the gateway at a
+Bedrock model that does not exist and every call to the primary fails:
+
+```bash
+BEDROCK_MODEL_ID=does.not.exist docker compose up -d --build gateway
+
+curl -N -X POST localhost:8080/v1/chat \
+  -H "X-API-Key: testkey" -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"hi"}]}'
+```
+
+The answer still streams, served by Ollama, and the `usage` frame names the model that produced it
+with `"cost_usd": 0`, because local inference is free and the meter prices by the model that actually
+answered rather than the one configured. In the logs:
+
+```json
+{"level":"WARN","msg":"provider failover","served_by":"ollama","failed":"bedrock: ..."}
+```
+
+After five consecutive failures the primary's circuit opens, the **Circuit breaker state** panel turns
+red, and `gateway_provider_attempts_total{provider="bedrock",outcome="rejected"}` starts climbing:
+calls are now being refused in microseconds instead of waiting out the retry budget. Thirty seconds
+later exactly one probe is admitted to test recovery.
 
 ### What is on the dashboard
 
@@ -519,6 +595,8 @@ the limiter and the `429` panel has something to show without a load generator.
 | `gateway_generation_duration_seconds` | histogram | `model`, `stream` | Upstream model time only, separating Bedrock latency from gateway overhead |
 | `gateway_upstream_errors_total` | counter | `model`, `stream` | Calls that failed after the retry budget was spent, distinct from the `502` rate |
 | `gateway_active_streams` | gauge | none | SSE streams open right now; falls when a client disconnects |
+| `gateway_provider_attempts_total` | counter | `provider`, `outcome` | Which backend served, and whether a call succeeded, failed, or was refused by an open circuit without being made |
+| `gateway_circuit_state` | gauge | `provider` | Circuit breaker state per backend: `0` closed, `1` half-open, `2` open |
 
 Two things are deliberately **absent**, and they are the decisions I would defend in a review:
 
@@ -544,6 +622,14 @@ Two things are deliberately **absent**, and they are the decisions I would defen
 - **Percentiles are estimates**, interpolated from histogram buckets rather than computed from sorted
   observations. Accurate enough for dashboards and alerting, and worth saying rather than quoting p95
   as if it were measured directly.
+- **Breaker state is per task, not per fleet.** Each task counts its own failures, so with *n* tasks a
+  failing provider absorbs up to *n* times the threshold before every circuit is open. Same trade-off
+  as the in-memory rate limiter, and it has the same answer: shared state in Redis. Correct and
+  defensible for a single task, which is what this deploys.
+- **The deployed task runs single backend.** `OLLAMA_URL` is unset on ECS, so Bedrock is the only
+  provider there and the router degrades to a list of one. Running Ollama in the cloud means paying
+  for a GPU task to sit idle, which buys nothing this project is trying to demonstrate. The full
+  routing path runs locally from one `docker compose up`.
 
 The full reasoning, including a PromQL reference for every panel, is in
 [`content/observability.md`](content/observability.md).

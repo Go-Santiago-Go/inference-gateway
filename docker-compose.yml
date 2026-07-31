@@ -27,8 +27,26 @@ services:
       RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-2}
       RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-5}
       CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+      # Setting this is what turns on fallback routing. Unset (as on ECS) the
+      # gateway runs single backend, so the deploy needs no Ollama.
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+      BREAKER_THRESHOLD: ${BREAKER_THRESHOLD:-5}
+      BREAKER_COOLDOWN_SECONDS: ${BREAKER_COOLDOWN_SECONDS:-30}
     volumes:
       - ${HOME}/.aws:/aws:ro
+    depends_on:
+      - ollama
+
+  # The fallback backend. Pull the model once after first start:
+  #   docker compose exec ollama ollama pull llama3.2
+  # The named volume keeps it across restarts, so this is a one-time cost.
+  ollama:
+    image: ollama/ollama:0.32.5
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
 
   prometheus:
     image: prom/prometheus:v3.13.2
@@ -67,3 +85,4 @@ services:
 
 volumes:
   prometheus-data:
+  ollama-data:

@@ -102,6 +102,8 @@ func TestHandlerExposesEveryGatewayCollector(t *testing.T) {
 	RecordGeneration("test-model", true, 1, 1, 0.0001, time.Second)
 	RecordFirstToken("test-model", 300*time.Millisecond)
 	RecordUpstreamError("test-model", true)
+	RecordProviderAttempt("test-provider", OutcomeSuccess)
+	SetCircuitState("test-provider", 0)
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
@@ -121,6 +123,8 @@ func TestHandlerExposesEveryGatewayCollector(t *testing.T) {
 		"gateway_time_to_first_token_seconds_bucket",
 		"gateway_upstream_errors_total",
 		"gateway_active_streams",
+		"gateway_provider_attempts_total",
+		"gateway_circuit_state",
 		// Free from registering into the default registry, and worth asserting so
 		// a future switch to a custom registry does not silently drop them.
 		"go_goroutines",

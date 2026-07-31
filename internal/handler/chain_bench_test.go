@@ -10,8 +10,8 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"github.com/Go-Santiago-Go/inference-gateway/internal/bedrock"
 	"github.com/Go-Santiago-Go/inference-gateway/internal/middleware"
+	"github.com/Go-Santiago-Go/inference-gateway/internal/provider"
 )
 
 // benchWriter is a throwaway ResponseWriter that discards all output while still
@@ -32,7 +32,7 @@ func (b *benchWriter) Flush()                      {}
 // buildChain wires the full production middleware chain from main.go around the
 // streaming handler, backed by the fake generator so no AWS call is made.
 func buildChain() http.Handler {
-	gen := fakeGenerator{comp: bedrock.Completion{Text: "hello world", TokensIn: 1500, TokensOut: 800}}
+	gen := fakeGenerator{comp: provider.Completion{Text: "hello world", TokensIn: 1500, TokensOut: 800}}
 	h := New(gen, "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 
 	cors := middleware.CORS("http://localhost:5173")

@@ -76,6 +76,31 @@ var (
 		Name: "gateway_active_streams",
 		Help: "SSE streams currently open.",
 	})
+
+	// Labelled by backend rather than by model, because the routing question is
+	// which provider served the request. Both label sets stay small and closed:
+	// backends are named in main, and outcome is one of three constants.
+	providerAttempts = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gateway_provider_attempts_total",
+		Help: "Generation attempts per backend, by outcome: success, error, or rejected by an open circuit.",
+	}, []string{"provider", "outcome"})
+
+	// A gauge because a circuit moves between states in both directions. The
+	// value is the state's ordinal, which Grafana maps back to a name; encoding
+	// state as a label instead would need one series per state per backend to
+	// say the same thing.
+	circuitState = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "gateway_circuit_state",
+		Help: "Circuit breaker state per backend: 0 closed, 1 half-open, 2 open.",
+	}, []string{"provider"})
+)
+
+// Provider attempt outcomes. They are constants rather than free strings so the
+// label's value set stays closed and a typo cannot mint a new time series.
+const (
+	OutcomeSuccess  = "success"
+	OutcomeError    = "error"
+	OutcomeRejected = "rejected"
 )
 
 // Handler returns the HTTP handler serving the Prometheus exposition format.
@@ -125,6 +150,20 @@ func StreamStarted() {
 // StreamEnded marks an SSE stream as closed.
 func StreamEnded() {
 	activeStreams.Dec()
+}
+
+// RecordProviderAttempt counts one call against a backend. Outcome must be one
+// of the Outcome constants. A rejected attempt never reached the backend, which
+// is what distinguishes a tripped circuit from an upstream failure on a graph.
+func RecordProviderAttempt(provider, outcome string) {
+	providerAttempts.WithLabelValues(provider, outcome).Inc()
+}
+
+// SetCircuitState records a backend's circuit breaker state, where the value is
+// the State's ordinal. Called on transition rather than polled, so the gauge is
+// accurate between scrapes instead of only at them.
+func SetCircuitState(provider string, state int) {
+	circuitState.WithLabelValues(provider).Set(float64(state))
 }
 
 // routes is the fixed set of paths the gateway serves. Anything else collapses
