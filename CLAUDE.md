@@ -13,10 +13,12 @@ metering. A React and TypeScript client in `client/` exercises all of it in a br
 Needs AWS credentials with Bedrock model access for a Claude model in your region. No database, no
 container required.
 
+`make help` lists every target. The ones below are the common paths.
+
 ```bash
-export AWS_REGION=us-east-1
+export AWS_REGION=us-east-1    # or put both in a gitignored .env, which make loads
 export API_KEYS=testkey        # refuses to boot without at least one key
-go run ./cmd/server            # listens on :8080
+make run                       # listens on :8080
 ```
 
 ```bash
@@ -29,42 +31,40 @@ The full stack, adding the fallback backend, Prometheus, and Grafana with the da
 provisioned:
 
 ```bash
-docker compose up -d --build   # Grafana :3000, Prometheus :9090, gateway :8080, Ollama :11434
-docker compose exec ollama ollama pull llama3.2   # one time, about 2 GB
-docker compose down -v
+make up                 # Grafana :3000, Prometheus :9090, gateway :8080, Ollama :11434
+make ollama-pull        # one time, about 2 GB
+make down VOLUMES=1     # VOLUMES=1 also drops the Prometheus and Ollama volumes
 ```
 
 The web client:
 
 ```bash
-cd client && npm install
-npm run dev     # reads VITE_API_BASE from client/.env, default http://localhost:8080
+make client     # reads VITE_API_BASE from client/.env, default http://localhost:8080
 ```
 
 ## Verify a change
 
-What CI runs, and what should pass before any commit:
+What CI runs, plus the `gofmt` check that `lint` adds on top. All of it should pass before any commit:
 
 ```bash
-go build ./... && go vet ./... && go test ./...
-cd client && npm ci && npm run build && npm test
+make build lint test
+make client-test
 ```
 
-Narrower loops while working:
+Narrower loops while working. These stay raw `go test`, since a target per package would be noise:
 
 ```bash
 go test ./internal/meter                 # one package
 go test -run TestCost ./internal/meter   # one test
 
-# benchmarks: no AWS, no cost, they run against a fake Generator
-go test -run '^$' -bench . -benchmem ./internal/handler ./internal/middleware
+make bench      # no AWS, no cost, they run against a fake Generator
 ```
 
 The deployed artifact is a multi-stage build to distroless:
 
 ```bash
-docker build -t inference-gateway .
-docker run -p 8080:8080 -e AWS_REGION=us-east-1 -e API_KEYS=testkey inference-gateway
+make docker-build     # tags inference-gateway:local
+docker run -p 8080:8080 -e AWS_REGION=us-east-1 -e API_KEYS=testkey inference-gateway:local
 ```
 
 ## Things that will waste your time
@@ -75,12 +75,12 @@ docker run -p 8080:8080 -e AWS_REGION=us-east-1 -e API_KEYS=testkey inference-ga
   also why the deployed ECS task does not fail over.
 - **Force a failover on purpose** by pointing the primary at a model that does not exist:
   `BEDROCK_MODEL_ID=does.not.exist docker compose up -d --build gateway`.
-- **Benchmarks cost nothing.** They run against a fake `Generator`, so no AWS credentials and no
-  Bedrock calls. Run them freely.
+- **Benchmarks cost nothing.** `make bench` runs against a fake `Generator`, so no AWS credentials and
+  no Bedrock calls. Run them freely.
 - **Load-test with `hey`** to see the limiter reject traffic:
   `hey -n 200 -c 20 -H "X-API-Key: testkey" -m POST -d '{"messages":[{"role":"user","content":"hi"}]}' http://localhost:8080/v1/chat`
-- **Tear down billable AWS resources after each session.** `infra/` is the billable stack and gets
-  destroyed; `infra/bootstrap/` is free and stays up.
+- **Tear down billable AWS resources after each session.** `make destroy` takes down `infra/`, the
+  billable stack; `infra/bootstrap/` is free and stays up.
 - **Before writing docs, read `docs/CONVENTIONS.md`.** It carries the accuracy guards, and each one is
   there because it was gotten wrong.
 
@@ -108,3 +108,4 @@ docker run -p 8080:8080 -e AWS_REGION=us-east-1 -e API_KEYS=testkey inference-ga
 | `client/` | React + TypeScript (Vite) client. |
 | `infra/` | Terraform. `infra/bootstrap/` is free and persistent; `infra/` is billable. |
 | `observability/` | Prometheus scrape config, provisioned Grafana datasource and dashboard. |
+| `Makefile` | Task runner wrapping everything above. `make help` lists the targets. |
