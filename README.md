@@ -162,8 +162,10 @@ cd inference-gateway
 
 export AWS_REGION=us-east-1
 export API_KEYS=testkey        # the server refuses to boot without at least one key
-go run ./cmd/server            # listens on :8080
+make run                       # listens on :8080
 ```
+
+Both variables can live in a gitignored `.env` instead; the Makefile loads one if it is there.
 
 ```bash
 # -N disables curl buffering so tokens print as they arrive
@@ -180,12 +182,13 @@ curl -N -X POST localhost:8080/v1/chat \
 The whole stack, including the fallback backend and a Grafana with the dashboard already loaded:
 
 ```bash
-docker compose up -d --build
-docker compose exec ollama ollama pull llama3.2   # one time, about 2 GB
-open http://localhost:3000                        # Grafana, nothing to click
+make up                      # gateway, Ollama, Prometheus, Grafana
+make ollama-pull             # one time, about 2 GB
+open http://localhost:3000   # Grafana, nothing to click
 ```
 
-Full environment variable reference, the web client, and the container path are in
+`make help` lists the rest: `test`, `lint`, `bench`, the client targets, and the deploy and destroy
+pair. Full environment variable reference, the web client, and the container path are in
 [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md). To stand it up on AWS, see
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
@@ -340,6 +343,7 @@ real-time request preempt a batch job.
 | `infra/` | Terraform. `infra/bootstrap/` is the free persistent stack; `infra/` is the billable app stack. |
 | `observability/` | Prometheus scrape config and provisioned Grafana datasource and dashboard. |
 | `docs/` | Architecture, API reference, local development, deployment, operations. |
+| `Makefile` | Task runner. Same verbs as the other repos in this portfolio; `make help` lists them. |
 
 ## Documentation
 
