@@ -1,6 +1,6 @@
 {
-  "uid": "infer-gateway",
-  "title": "infer-gateway",
+  "uid": "inference-gateway",
+  "title": "inference-gateway",
   "description": "Traffic, latency, token throughput and inference spend for the Go inference gateway fronting Amazon Bedrock.",
   "tags": [
     "inference-gateway",

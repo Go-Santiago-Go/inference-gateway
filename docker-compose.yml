@@ -7,7 +7,7 @@
 # scraping a load balancer address would round-robin across tasks and sample one
 # arbitrary task's counters as if they were the fleet's. See README.
 
-name: infer-gateway
+name: inference-gateway
 
 services:
   gateway:
