@@ -10,3 +10,7 @@ infra/*.tfstate*
 
 content
 *.md
+
+# The local observability stack is orchestration around the image, not an input to it.
+observability
+docker-compose.yml

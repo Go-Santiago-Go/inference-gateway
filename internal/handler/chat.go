@@ -1,5 +1,5 @@
 // Package handler contains the HTTP handlers for the gateway. Handlers stay
-// thin: they parse the request, delegate generation to a bedrock.Generator, and
+// thin: they parse the request, delegate generation to a provider.Generator, and
 // write the response. Cross-cutting concerns live in internal/middleware.
 package handler
 
@@ -8,23 +8,24 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Go-Santiago-Go/inference-gateway/internal/bedrock"
 	"github.com/Go-Santiago-Go/inference-gateway/internal/meter"
+	"github.com/Go-Santiago-Go/inference-gateway/internal/metrics"
 	"github.com/Go-Santiago-Go/inference-gateway/internal/middleware"
+	"github.com/Go-Santiago-Go/inference-gateway/internal/provider"
 )
 
-// Handler serves the chat endpoint. It depends on the bedrock.Generator
+// Handler serves the chat endpoint. It depends on the provider.Generator
 // interface, not a concrete client, so it can be tested against a fake and the
-// model can be swapped without changing handler code.
+// backend can be swapped without changing handler code.
 type Handler struct {
-	gen   bedrock.Generator
-	model string // Bedrock model ID this handler fronts; used to price and log each request.
+	gen   provider.Generator
+	model string // Model ID this handler fronts; used to price and log each request.
 }
 
 // New returns a Handler that delegates generation to gen. The model string names
-// the Bedrock model the handler fronts and is used to price and label every
-// request it serves.
-func New(gen bedrock.Generator, model string) *Handler {
+// the model the handler fronts and is used to price and label every request it
+// serves.
+func New(gen provider.Generator, model string) *Handler {
 	return &Handler{gen: gen, model: model}
 }
 
@@ -41,20 +42,20 @@ type chatRequest struct {
 	Messages []chatMessage `json:"messages"`
 }
 
-// toMessages validates the request's conversation and maps it onto the bedrock
+// toMessages validates the request's conversation and maps it onto the provider
 // message type. It returns false when the conversation is unusable: empty, a turn
 // with no content, or a final turn that is not the user's (there would be nothing
-// new to answer). Validating here keeps a malformed body from reaching Bedrock.
-func (req chatRequest) toMessages() ([]bedrock.Message, bool) {
+// new to answer). Validating here keeps a malformed body from reaching a backend.
+func (req chatRequest) toMessages() ([]provider.Message, bool) {
 	if len(req.Messages) == 0 {
 		return nil, false
 	}
-	msgs := make([]bedrock.Message, len(req.Messages))
+	msgs := make([]provider.Message, len(req.Messages))
 	for i, m := range req.Messages {
 		if m.Content == "" || (m.Role != "user" && m.Role != "assistant") {
 			return nil, false
 		}
-		msgs[i] = bedrock.Message{Role: m.Role, Text: m.Content}
+		msgs[i] = provider.Message{Role: m.Role, Text: m.Content}
 	}
 	if req.Messages[len(req.Messages)-1].Role != "user" {
 		return nil, false
@@ -72,6 +73,9 @@ type chatResponse struct {
 	TokensOut int     `json:"tokens_out"`
 	CostUSD   float64 `json:"cost_usd"`
 	LatencyMs int64   `json:"latency_ms"`
+	// Model names the backend that served the request, so a caller can see when
+	// a fallback answered rather than the primary.
+	Model string `json:"model,omitempty"`
 }
 
 // Chat handles POST /v1/chat: it decodes the prompt, calls the generator with
@@ -97,16 +101,22 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 			"err", err,
 			"model", h.model,
 		)
+		metrics.RecordUpstreamError(h.model, false)
 		http.Error(w, "generation failed", http.StatusBadGateway)
 		return
 	}
 	latency := time.Since(start)
 
-	cost := meter.Cost(h.model, comp.TokensIn, comp.TokensOut)
+	// Price and label by the model that answered, not the one configured: a
+	// router may have failed over, and charging a fallback's tokens at the
+	// primary's rate would invent spend that never happened.
+	model := h.resolveModel(comp.Model)
+	cost := meter.Cost(model, comp.TokensIn, comp.TokensOut)
+	metrics.RecordGeneration(model, false, comp.TokensIn, comp.TokensOut, cost, latency)
 
 	middleware.LoggerFromContext(r.Context()).Info("generation",
 		"key", key,
-		"model", h.model,
+		"model", model,
 		"tokens_in", comp.TokensIn,
 		"tokens_out", comp.TokensOut,
 		"cost_usd", cost,
@@ -119,13 +129,24 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 		TokensOut: comp.TokensOut,
 		CostUSD:   cost,
 		LatencyMs: latency.Milliseconds(),
+		Model:     model,
 	})
+}
+
+// resolveModel returns the model a backend reported, falling back to the one the
+// handler was configured with. A backend that reports nothing is the single
+// provider case, where the configured model is by definition the one that ran.
+func (h *Handler) resolveModel(reported string) string {
+	if reported != "" {
+		return reported
+	}
+	return h.model
 }
 
 // decodeChat decodes and validates a chat request body, returning the mapped
 // messages and false if the body is malformed. Shared by the streaming and
 // non-streaming handlers so both reject the same bad input identically.
-func decodeChat(r *http.Request, req *chatRequest) ([]bedrock.Message, bool) {
+func decodeChat(r *http.Request, req *chatRequest) ([]provider.Message, bool) {
 	if err := json.NewDecoder(r.Body).Decode(req); err != nil {
 		return nil, false
 	}

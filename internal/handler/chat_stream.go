@@ -8,14 +8,15 @@ import (
 	"time"
 
 	"github.com/Go-Santiago-Go/inference-gateway/internal/meter"
+	"github.com/Go-Santiago-Go/inference-gateway/internal/metrics"
 	"github.com/Go-Santiago-Go/inference-gateway/internal/middleware"
 )
 
 // ChatStream handles POST /v1/chat as a Server-Sent Events stream: it relays
-// each token as a data frame the instant Bedrock produces it, then emits one
-// final `event: usage` frame with the request's token counts, cost, and
-// latency. It passes the request context to the generator so a client
-// disconnect cancels the upstream Bedrock call instead of paying for unread
+// each token as a data frame the instant the backend produces it, then emits one
+// final `event: usage` frame with the request's token counts, cost, latency, and
+// the model that answered. It passes the request context to the generator so a
+// client disconnect cancels the upstream call instead of paying for unread
 // tokens.
 func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	var req chatRequest
@@ -40,6 +41,13 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 
 	key := middleware.KeyFromContext(r.Context())
 
+	// Counted from here rather than from the top of the handler so a request
+	// rejected for being unstreamable never enters the gauge. The defer is what
+	// keeps the gauge honest: a client disconnect unwinds through it just like a
+	// clean finish, so an abandoned stream is not left counted as open forever.
+	metrics.StreamStarted()
+	defer metrics.StreamEnded()
+
 	start := time.Now()
 	stream, err := h.gen.GenerateStream(r.Context(), messages)
 	if err != nil {
@@ -51,6 +59,7 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 			"model", h.model,
 			"stream", true,
 		)
+		metrics.RecordUpstreamError(h.model, true)
 		// Must return: on error stream is nil, and ranging a nil channel blocks
 		// forever. This can still set a status because no frame has been sent.
 		http.Error(w, "generation failed", http.StatusBadGateway)
@@ -60,7 +69,18 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	// Relay each text chunk as its own SSE frame, flushing so it leaves
 	// immediately; the terminal chunk carries token counts and no text.
 	var tokensIn, tokensOut int
+	// Which model answered is only known once chunks arrive, because a router may
+	// have failed over to a backend other than the configured primary. It is
+	// tracked from the first chunk so even the time-to-first-token metric is
+	// attributed to the model that actually produced that token.
+	model := h.model
+	// Time to first token is measured separately from total latency because they
+	// answer different questions: total latency is how long the answer took, TTFT
+	// is how long the user stared at an empty box. Only the first text chunk
+	// counts, so a terminal usage-only chunk cannot be mistaken for output.
+	firstTokenSent := false
 	for chunk := range stream {
+		model = h.resolveModel(chunk.Model)
 		if chunk.Text != "" {
 			// A blank line terminates an SSE frame, so text containing newlines
 			// cannot be written as a single data line without truncating the
@@ -72,6 +92,13 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 			}
 			fmt.Fprint(w, "\n")
 			flusher.Flush()
+
+			// Recorded after the flush, so the measurement covers the token
+			// actually leaving rather than merely being written to a buffer.
+			if !firstTokenSent {
+				firstTokenSent = true
+				metrics.RecordFirstToken(model, time.Since(start))
+			}
 		}
 		if chunk.TokensIn != 0 || chunk.TokensOut != 0 {
 			tokensIn, tokensOut = chunk.TokensIn, chunk.TokensOut
@@ -79,13 +106,14 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	latency := time.Since(start)
-	cost := meter.Cost(h.model, tokensIn, tokensOut)
+	cost := meter.Cost(model, tokensIn, tokensOut)
+	metrics.RecordGeneration(model, true, tokensIn, tokensOut, cost, latency)
 
 	// One structured line per request, the same fields as the non-streaming
 	// path; stream:true distinguishes the two endpoints in the logs.
 	middleware.LoggerFromContext(r.Context()).Info("generation",
 		"key", key,
-		"model", h.model,
+		"model", model,
 		"tokens_in", tokensIn,
 		"tokens_out", tokensOut,
 		"cost_usd", cost,
@@ -95,7 +123,7 @@ func (h *Handler) ChatStream(w http.ResponseWriter, r *http.Request) {
 
 	// Same metered fields as the non-streaming path, delivered as a named frame
 	// so the client can tell the usage summary from a token frame.
-	usage := chatResponse{TokensIn: tokensIn, TokensOut: tokensOut, CostUSD: cost, LatencyMs: latency.Milliseconds()}
+	usage := chatResponse{TokensIn: tokensIn, TokensOut: tokensOut, CostUSD: cost, LatencyMs: latency.Milliseconds(), Model: model}
 	payload, _ := json.Marshal(usage)
 	fmt.Fprintf(w, "event: usage\ndata: %s\n\n", payload)
 	flusher.Flush()

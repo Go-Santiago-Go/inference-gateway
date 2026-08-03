@@ -1,0 +1,88 @@
+# Local observability stack: the gateway plus the Prometheus that scrapes it and
+# the Grafana that draws it. Everything shares one Compose network, so Prometheus
+# reaches the gateway by service name and no ports need publishing between them.
+#
+# This runs locally rather than against the deployed ECS task on purpose.
+# Prometheus pulls, so it needs reachability to each individual instance;
+# scraping a load balancer address would round-robin across tasks and sample one
+# arbitrary task's counters as if they were the fleet's. See README.
+
+name: inference-gateway
+
+services:
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      # Pointed at the read-only mount below rather than left to the default
+      # ~/.aws lookup, because the distroless image runs as nonroot with no home.
+      AWS_CONFIG_FILE: /aws/config
+      AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
+      API_KEYS: ${API_KEYS:-testkey}
+      # Deliberately tight so a handful of curl calls trip the limiter and the
+      # 429 panel has something to show without needing a load generator.
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-2}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-5}
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+      # Setting this is what turns on fallback routing. Unset (as on ECS) the
+      # gateway runs single backend, so the deploy needs no Ollama.
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+      BREAKER_THRESHOLD: ${BREAKER_THRESHOLD:-5}
+      BREAKER_COOLDOWN_SECONDS: ${BREAKER_COOLDOWN_SECONDS:-30}
+    volumes:
+      - ${HOME}/.aws:/aws:ro
+    depends_on:
+      - ollama
+
+  # The fallback backend. Pull the model once after first start:
+  #   docker compose exec ollama ollama pull llama3.2
+  # The named volume keeps it across restarts, so this is a one-time cost.
+  ollama:
+    image: ollama/ollama:0.32.5
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+
+  prometheus:
+    image: prom/prometheus:v3.13.2
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # Short retention: this stack exists to demo and debug, not to archive.
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - gateway
+
+  grafana:
+    image: grafana/grafana:13.1.1
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Anonymous viewer access so anyone who clones the repo lands on the
+      # dashboard without a login prompt. Safe because nothing here is exposed
+      # beyond localhost and no metric carries caller identity.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/inference-gateway.json
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:
+  ollama-data:

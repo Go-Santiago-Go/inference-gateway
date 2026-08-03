@@ -1,0 +1,19 @@
+# Loads every dashboard JSON file from disk at startup and re-reads them
+# periodically. Dashboards live in version control rather than in Grafana's
+# database for the same reason infrastructure lives in Terraform: one that
+# exists only because somebody clicked it is not reproducible.
+
+apiVersion: 1
+
+providers:
+  - name: inference-gateway
+    orgId: 1
+    type: file
+    disableDeletion: false
+    # Edits made in the UI are allowed and survive until the next reload, which
+    # makes it practical to iterate in Grafana and then export back to the file.
+    allowUiUpdates: true
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

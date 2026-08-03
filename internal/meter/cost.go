@@ -1,21 +1,29 @@
-// Package meter turns Bedrock token counts into a per-request dollar cost using
-// a static per-model price table. It performs no I/O, so cost accounting is a
-// pure function the handler and the streaming path can both reuse.
+// Package meter turns a backend's token counts into a per-request dollar cost
+// using a static per-model price table. It performs no I/O, so cost accounting
+// is a pure function the handler and the streaming path can both reuse.
 package meter
 
 // Price is the cost of a model's tokens in US dollars per 1,000 tokens, split
-// because Bedrock prices input and output tokens at different rates.
+// because providers price input and output tokens at different rates.
 type Price struct {
 	In  float64
 	Out float64
 }
 
-// prices maps a Bedrock model ID to its per-1K-token price. Values are dollars
-// per 1,000 tokens.
+// prices maps a model ID to its per-1K-token price. Values are dollars per
+// 1,000 tokens.
 var prices = map[string]Price{
 	"us.anthropic.claude-haiku-4-5-20251001-v1:0": {
 		In:  0.001,
 		Out: 0.005,
+	},
+
+	// Locally hosted models are free. The entry is explicit rather than left to
+	// Cost's unknown-model fallback, so a model that genuinely costs nothing
+	// stays distinguishable from one whose price is simply missing.
+	"llama3.2": {
+		In:  0,
+		Out: 0,
 	},
 }
 

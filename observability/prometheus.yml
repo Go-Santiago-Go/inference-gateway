@@ -1,0 +1,25 @@
+# Prometheus scrape configuration for the local observability stack.
+#
+# Targets are static because everything runs on one Compose network and the
+# gateway is a single container at a known name. A deployed multi-task gateway
+# would need service discovery instead: scraping through a load balancer address
+# round-robins across tasks and samples one arbitrary task's counters as though
+# they were the whole fleet's.
+
+global:
+  # 5s rather than the 15s default so a demo or load test produces a visible
+  # curve within seconds. Faster scrapes cost storage and target CPU, so this is
+  # a local-only choice, not one to copy into production.
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: inference-gateway
+    static_configs:
+      - targets: ["gateway:8080"]
+
+  # Prometheus scrapes itself, which is what makes `up` and scrape duration
+  # available when debugging why a panel is empty.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

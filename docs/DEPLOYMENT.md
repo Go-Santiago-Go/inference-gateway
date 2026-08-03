@@ -1,4 +1,4 @@
-# Deploying infer-gateway to AWS
+# Deploying inference-gateway to AWS
 
 This walks through cloning the repo and standing up the whole system on AWS: a containerized Go
 gateway in front of Amazon Bedrock on ECS Express Mode, and the React client on S3 behind CloudFront,
@@ -7,8 +7,76 @@ tokens over SSE and a browser app that talks to it.
 
 Two warnings before you start. First, this creates **billable** resources, mainly the Express Mode
 load balancer at roughly $0.02 per hour. It is cents for a short session, but you must tear it down
-when done. Second, the local path (see the README quickstart) is free and proves the same request
-path, so deploy to AWS only when you actually want the cloud demo.
+when done. Second, the local path (see [LOCAL_DEV.md](LOCAL_DEV.md)) is free and proves the same
+request path, so deploy to AWS only when you actually want the cloud demo.
+
+## What gets provisioned
+
+I run the container on **Amazon ECS Express Mode on Fargate**: from an image plus three IAM roles,
+Express Mode provisions the Fargate service, an internet-facing load balancer with TLS, autoscaling,
+health checks, and the security-group wiring between the load balancer and the task, and hands back a
+public `*.ecs.<region>.on.aws` URL. There is no database and no data tier: rate-limit state lives in
+the task's memory, so the request path is just the load balancer and the app.
+
+The React client is a static bundle, so I serve it separately: a private S3 bucket fronted by
+CloudFront, reachable only through the distribution via an Origin Access Control. The browser
+therefore talks to two origins, CloudFront for the app and the load balancer for the API, which is
+why I wire the gateway's CORS allowlist to the distribution's domain at apply time.
+
+```mermaid
+flowchart LR
+    user(["Browser"])
+
+    subgraph edge["Static app"]
+        cf["CloudFront<br/>TLS · OAC"] --> s3[("S3 · private")]
+    end
+
+    subgraph vpc["VPC · public subnets"]
+        alb["Load Balancer<br/>TLS"] --> task["ECS Fargate task<br/>:8080 · single task"]
+    end
+
+    user -->|"load the app"| cf
+    user -->|"POST /v1/chat"| alb
+    task -.->|"ConverseStream"| bedrock["Bedrock"]
+    task -.->|"image at launch"| ecr[("ECR")]
+    task -.->|"API keys at startup"| ssm["SSM Parameter Store"]
+    task -.->|"structured logs"| cw["CloudWatch Logs"]
+```
+
+The two solid paths are what a browser does: **load the app** from CloudFront, then **call the API**
+through the load balancer into the ECS task. The dashed lines are the task's outbound calls. A
+multi-stage Docker build ships a distroless binary (8.6 MB compressed) for a small image and attack
+surface, and GitHub Actions builds and pushes it to ECR over GitHub OIDC, with no stored AWS
+credentials.
+
+The `infra/` directory holds two Terraform stacks, split by lifetime:
+
+- **`infra/bootstrap/`** provisions the free, long-lived pieces: the ECR repository and the GitHub
+  OIDC CI role. Apply it once and leave it up, so CI can push images at any time and images survive
+  the app stack's teardown.
+- **`infra/`** provisions the billable app stack: the ECS Express service and its infrastructure role,
+  the task and execution roles, the API keys as an SSM `SecureString`, the CloudWatch log group, and
+  the S3 and CloudFront hosting for the client. It looks the ECR repository up by name, so bootstrap
+  must be applied first. This is the stack you destroy after each session.
+
+The only meaningful cost while up is the Express Mode load balancer (roughly $0.02 per hour);
+CloudFront and S3 fall inside the always-free tier at this scale, and there is no database. A
+`destroy` after each session keeps the bill at pennies.
+
+### Three constraints worth knowing up front
+
+First, the ALB idle timeout is 60 seconds and Express Mode does not expose it as a tunable. In
+practice streams finish in one to two seconds, and it is an *idle* timer that resets on each byte, so
+it is never approached; a model that stalled longer than 60 seconds before its first token would need
+a heartbeat comment frame, which is a stretch item rather than something built.
+
+Second, the token-bucket limiters live in the task's memory, which is only globally correct while a
+**single task** serves traffic; scaling out would split each key's budget across tasks, so multi-task
+correctness needs shared state in Redis.
+
+Third, Express Mode places the tasks in public subnets in order to give the load balancer a public
+URL; the tasks have public IPs but stay unreachable because their security group admits only the load
+balancer. Keeping them fully private would mean dropping to a hand-rolled `aws_ecs_service`.
 
 ## Prerequisites
 

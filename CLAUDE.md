@@ -1,108 +1,110 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+How to get this repository running and how to verify a change. Everything else lives in `docs/`; see
+the map at the bottom.
 
-## Current state
+`inference-gateway` is a containerized Go service that puts the production operations layer in front
+of LLM inference: SSE token streaming, per-key auth, per-key rate limiting, retries with backoff and
+jitter, multi-provider routing with per-backend circuit breakers, and per-request token and cost
+metering. A React and TypeScript client in `client/` exercises all of it in a browser.
 
-Phases 0–8 are complete: the Go gateway, the React client, CI, and the Terraform for ECR and the IAM
-roles all exist and are committed. Phase 9 (deploy the gateway to ECS, host the client, capture live
-URLs) is in progress; the Dockerfile is built and verified locally against real Bedrock.
+## Run it
 
-`PROJECT3_BUILD_PLAN.md` is the authoritative, phased spec. **Phase 7 is the MVP cut line**;
-everything after is AWS deployment. `UI_SPEC.md` + `infer-gateway-ui-mock.html` are the behavioral
-and visual sources of truth for the client.
+Needs AWS credentials with Bedrock model access for a Claude model in your region. No database, no
+container required.
 
-`CLAUDE.local.md` holds the working style and teaching method for this repo and takes precedence for
-*how* to collaborate; this file covers *what* is being built.
-
-## What this is
-
-A containerized Go service in front of AWS Bedrock that adds the production operations layer around
-LLM inference (SSE token streaming, per-key API-key auth, per-key rate limiting, retries with
-backoff + jitter, and per-request token/cost accounting via structured `slog` logs), plus a React +
-TypeScript client (`client/`) that makes each of those features visible in a browser.
-
-## Commands (as scaffolded per the build plan)
-
-Go backend:
 ```bash
-go run ./cmd/server        # run the gateway (listens on :8080)
-go build ./...
-go vet ./...
-go test ./...              # all tests
-go test ./internal/meter   # a single package
-go test -run TestCost ./internal/meter   # a single test
+export AWS_REGION=us-east-1
+export API_KEYS=testkey        # refuses to boot without at least one key
+go run ./cmd/server            # listens on :8080
 ```
 
-Docker (the deployed artifact; multi-stage build to distroless):
 ```bash
-docker build -t infer-gateway .
-docker run -p 8080:8080 -e AWS_REGION=us-east-1 -e API_KEYS=testkey infer-gateway
-```
-
-Web client (`client/`, Vite + React + TS):
-```bash
-cd client && npm install
-npm run dev                # VITE_API_BASE=http://localhost:8080 in client/.env
-npm run build              # emits client/dist
-```
-
-Smoke-test the stream and the rate limiter:
-```bash
-curl -N -X POST http://localhost:8080/v1/chat \
+curl -N -X POST localhost:8080/v1/chat \
   -H "X-API-Key: testkey" -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"hi"}]}'
-hey -n 200 -c 20 -H "X-API-Key: testkey" -m POST \
-  -d '{"messages":[{"role":"user","content":"hi"}]}' http://localhost:8080/v1/chat
 ```
 
-CI (`.github/workflows/ci.yml`) runs `go build`/`go vet`/`go test`; a `client/` build job is added in
-Phase 7.
+The full stack, adding the fallback backend, Prometheus, and Grafana with the dashboard already
+provisioned:
 
-## Architecture (the big picture)
+```bash
+docker compose up -d --build   # Grafana :3000, Prometheus :9090, gateway :8080, Ollama :11434
+docker compose exec ollama ollama pull llama3.2   # one time, about 2 GB
+docker compose down -v
+```
 
-**Everything is a middleware chain, and the handler stays thin.** The request pipeline is
-`CORS → auth → rate limit → logging/meter → handler`, each concern wrapping the next. This is the
-spine of the service: cross-cutting concerns (auth, limits, cost metering, logging) live in
-`internal/middleware`, never inside handlers, so each is testable in isolation and the handler is pure
-orchestration.
+The web client:
 
-**The Bedrock client sits behind a Go interface** (`Generator`, in `internal/bedrock`). Handlers
-depend on the interface, so they test against a fake with no AWS calls, and models/providers swap
-without touching handler code. Retry-with-backoff+jitter logic also lives here, and retries *only*
-transient errors (throttling, transient 5xx), never 4xx.
+```bash
+cd client && npm install
+npm run dev     # reads VITE_API_BASE from client/.env, default http://localhost:8080
+```
 
-**Context propagation is load-bearing.** `r.Context()` flows from handler → `Generator` → Bedrock
-call. A client disconnect (or the web client's Stop button) cancels the context, which stops the
-in-flight Bedrock call and the retry loop instead of burning tokens. Preserve this wiring in any
-change to the request path.
+## Verify a change
 
-**Metering is built in from the first (non-streaming) call, not bolted on.** `internal/meter`
-multiplies Converse token counts by a per-model price table to produce `cost_usd`. The streaming path
-reuses the same meter and emits a final SSE `event: usage` frame carrying
-`{tokens_in, tokens_out, cost_usd, latency_ms}`, the same fields logged as one structured JSON line
-per request, and the same fields the client's metrics footer renders.
+What CI runs, and what should pass before any commit:
 
-**Streaming is SSE over plain HTTP, relayed with `http.Flusher`.** `POST /v1/chat` streams Bedrock
-`ConverseStream` chunks as `data:` frames, flushing each so it leaves immediately, then the `usage`
-frame. SSE (not WebSockets) because the flow is one-directional and works through ALBs and `curl`.
-The client reads it with `fetch` + `ReadableStream` (**not** `EventSource`, which can't POST) and an
-`AbortController` for Stop.
+```bash
+go build ./... && go vet ./... && go test ./...
+cd client && npm ci && npm run build && npm test
+```
 
-Planned Go layout: `cmd/server/` (wires middleware + handler, starts server) · `internal/handler`,
-`internal/middleware`, `internal/bedrock`, `internal/meter` · `client/` (the web client) · `infra/` (Terraform,
-Phase 8+).
+Narrower loops while working:
 
-## Key design decisions to preserve
+```bash
+go test ./internal/meter                 # one package
+go test -run TestCost ./internal/meter   # one test
 
-- **Non-streaming Converse first, then `ConverseStream`.** Get a boring completion working before the
-  SSE relay. Verify the current streaming SDK shape against live AWS docs; it changes.
-- **In-memory per-key rate limiting** (token bucket via `golang.org/x/time/rate`, one limiter per key
-  in a `sync.Map`). Correct for a single ECS task; Redis is the multi-task answer and is a Stretch item.
-- **No database in the MVP.** Rate-limit state is in-memory by design.
-- **Deploy target is ECS Express Mode on Fargate** (App Runner is closed to new customers). Confirm
-  Terraform support for Express Mode before relying on it; fall back to `aws_ecs_service` +
-  `aws_ecs_task_definition` if needed, and verify ALB idle-timeout won't cut SSE connections.
+# benchmarks: no AWS, no cost, they run against a fake Generator
+go test -run '^$' -bench . -benchmem ./internal/handler ./internal/middleware
+```
 
-Anything past the Phase 7 MVP (batching, OTel tracing, Redis, Prometheus, multi-provider routing) is
-on the Stretch list in the build plan; do not build it before the MVP ships.
+The deployed artifact is a multi-stage build to distroless:
+
+```bash
+docker build -t inference-gateway .
+docker run -p 8080:8080 -e AWS_REGION=us-east-1 -e API_KEYS=testkey inference-gateway
+```
+
+## Things that will waste your time
+
+- **`API_KEYS` is required.** The server exits at startup without it rather than serving an open
+  endpoint.
+- **Failover needs `OLLAMA_URL`.** Unset, the router is a list of one, and nothing warns you. This is
+  also why the deployed ECS task does not fail over.
+- **Force a failover on purpose** by pointing the primary at a model that does not exist:
+  `BEDROCK_MODEL_ID=does.not.exist docker compose up -d --build gateway`.
+- **Benchmarks cost nothing.** They run against a fake `Generator`, so no AWS credentials and no
+  Bedrock calls. Run them freely.
+- **Load-test with `hey`** to see the limiter reject traffic:
+  `hey -n 200 -c 20 -H "X-API-Key: testkey" -m POST -d '{"messages":[{"role":"user","content":"hi"}]}' http://localhost:8080/v1/chat`
+- **Tear down billable AWS resources after each session.** `infra/` is the billable stack and gets
+  destroyed; `infra/bootstrap/` is free and stays up.
+- **Before writing docs, read `docs/CONVENTIONS.md`.** It carries the accuracy guards, and each one is
+  there because it was gotten wrong.
+
+## Where everything is
+
+| Doc | Scope |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Middleware chain and its ordering, `Generator` composition, failover and breaker boundaries, the web client |
+| [docs/API.md](docs/API.md) | Endpoint reference, status codes, cost accounting, rate limiter behavior, retry classification and schedule |
+| [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md) | Full environment variable reference, the client, the Compose stack, tests and benchmarks |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | What gets provisioned on AWS, both Terraform stacks, step by step deploy, teardown, troubleshooting |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Collectors, PromQL reference, forcing a failover, benchmarks, cardinality decisions |
+| [docs/CONVENTIONS.md](docs/CONVENTIONS.md) | Documentation rules, the README spine, accuracy guards, generated artifacts |
+
+| Path | Contents |
+|---|---|
+| `cmd/server/` | Wires middleware, backends, and handler. The only package naming a concrete backend. |
+| `internal/provider/` | The `Generator` interface and its neutral types. No implementations. |
+| `internal/bedrock/`, `internal/ollama/` | The two backends. Retry with backoff and jitter lives in `bedrock`. |
+| `internal/router/`, `internal/breaker/` | Ordered fallback and per-backend circuit breaking. Both are `Generator`s. |
+| `internal/handler/` | The `/v1/chat` SSE relay and the probes. |
+| `internal/middleware/` | CORS, auth, rate limiting, logging, metrics. |
+| `internal/meter/` | Token counts times a per-model price table. |
+| `internal/metrics/` | Prometheus collectors and the route-label allowlist. |
+| `client/` | React + TypeScript (Vite) client. |
+| `infra/` | Terraform. `infra/bootstrap/` is free and persistent; `infra/` is billable. |
+| `observability/` | Prometheus scrape config, provisioned Grafana datasource and dashboard. |

@@ -1,22 +1,29 @@
+// Package bedrock implements the provider.Generator interface against AWS
+// Bedrock's Converse and ConverseStream APIs. The AWS-specific request and
+// response unpacking lives here and nowhere else, along with the retry policy
+// for transient upstream failures.
 package bedrock
 
 import (
 	"context"
 	"fmt"
 
+	"github.com/Go-Santiago-Go/inference-gateway/internal/provider"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 )
 
-// Compile-time check that Client satisfies the Generator interface. If the
-// method signature ever drifts, this fails to build instead of at a call site.
-var _ Generator = (*Client)(nil)
+// Compile-time check that Client satisfies provider.Generator. Go interface
+// satisfaction is implicit, so nothing else in this file names the interface;
+// this assertion makes a signature drift a build failure here rather than a
+// failure at the wiring call site in main.
+var _ provider.Generator = (*Client)(nil)
 
-// Client is the production Generator: it calls AWS Bedrock's Converse API. It
-// satisfies the Generator interface, so handlers depend on the interface and
-// this concrete type is injected only at wiring in main.
+// Client is the Bedrock provider: it calls AWS Bedrock's Converse API. It
+// satisfies provider.Generator, so handlers depend on the interface and this
+// concrete type is injected only at wiring in main.
 type Client struct {
 	api     *bedrockruntime.Client
 	modelID string
@@ -44,7 +51,7 @@ func New(ctx context.Context, modelID string) (*Client, error) {
 // toBedrockMessages maps the interface's Message slice onto the SDK's message
 // shape: one content block of text per turn, with the role translated. An
 // unrecognized role falls back to user, the only role a single-turn caller sends.
-func toBedrockMessages(messages []Message) []types.Message {
+func toBedrockMessages(messages []provider.Message) []types.Message {
 	out := make([]types.Message, len(messages))
 	for i, m := range messages {
 		role := types.ConversationRoleUser
@@ -63,7 +70,7 @@ func toBedrockMessages(messages []Message) []types.Message {
 // completion with its token counts. The context flows into the SDK call, so a
 // client disconnect cancels the in-flight request instead of paying for a
 // dropped response.
-func (c *Client) Generate(ctx context.Context, messages []Message) (Completion, error) {
+func (c *Client) Generate(ctx context.Context, messages []provider.Message) (provider.Completion, error) {
 	// out is assigned by the closure rather than returned, because withRetry's fn
 	// signature carries only an error.
 	var out *bedrockruntime.ConverseOutput
@@ -76,7 +83,7 @@ func (c *Client) Generate(ctx context.Context, messages []Message) (Completion, 
 		return err
 	})
 	if err != nil {
-		return Completion{}, err
+		return provider.Completion{}, err
 	}
 
 	// out.Output is a union of possible output shapes. Assert the message
@@ -84,7 +91,7 @@ func (c *Client) Generate(ctx context.Context, messages []Message) (Completion, 
 	// shape) so we can read its content blocks, which are themselves a union.
 	msg, ok := out.Output.(*types.ConverseOutputMemberMessage)
 	if !ok {
-		return Completion{}, fmt.Errorf("bedrock: unexpected output type %T", out.Output)
+		return provider.Completion{}, fmt.Errorf("bedrock: unexpected output type %T", out.Output)
 	}
 
 	// Each content block is itself a union (text, image, tool use). Range over
@@ -102,10 +109,11 @@ func (c *Client) Generate(ctx context.Context, messages []Message) (Completion, 
 	tokensIn := int(aws.ToInt32(out.Usage.InputTokens))
 	tokensOut := int(aws.ToInt32(out.Usage.OutputTokens))
 
-	return Completion{
+	return provider.Completion{
 		Text:      text,
 		TokensIn:  tokensIn,
 		TokensOut: tokensOut,
+		Model:     c.modelID,
 	}, nil
 }
 
@@ -115,7 +123,7 @@ func (c *Client) Generate(ctx context.Context, messages []Message) (Completion, 
 // the token counts before closing. The channel closes when the model finishes,
 // ctx is cancelled, or the stream errors, so a client disconnect stops the
 // upstream call instead of paying for tokens no one will read.
-func (c *Client) GenerateStream(ctx context.Context, messages []Message) (<-chan Chunk, error) {
+func (c *Client) GenerateStream(ctx context.Context, messages []provider.Message) (<-chan provider.Chunk, error) {
 	// Starting the stream can fail synchronously (bad model ID, auth); surface
 	// that as an ordinary error before any goroutine exists so the handler can
 	// still set a response status. The Messages shape matches Generate exactly.
@@ -140,7 +148,7 @@ func (c *Client) GenerateStream(ctx context.Context, messages []Message) (<-chan
 	// Unbuffered: each send blocks until the handler receives, so the producer
 	// cannot race ahead of the consumer. This backpressure is what keeps the
 	// relay honest and ties chunk delivery to the handler's flush cadence.
-	ch := make(chan Chunk)
+	ch := make(chan provider.Chunk)
 
 	// Read the Bedrock event stream in the background and return ch immediately,
 	// so the handler starts relaying and flushing chunks while the model is
@@ -168,7 +176,7 @@ func (c *Client) GenerateStream(ctx context.Context, messages []Message) (<-chan
 				// plain send would block forever. ctx.Done() lets us abandon the
 				// stream instead of leaking this goroutine.
 				select {
-				case ch <- Chunk{Text: text.Value}:
+				case ch <- provider.Chunk{Text: text.Value, Model: c.modelID}:
 				case <-ctx.Done():
 					return
 				}
@@ -177,9 +185,10 @@ func (c *Client) GenerateStream(ctx context.Context, messages []Message) (<-chan
 				// text, which the handler turns into the trailing usage frame.
 				if u := e.Value.Usage; u != nil {
 					select {
-					case ch <- Chunk{
+					case ch <- provider.Chunk{
 						TokensIn:  int(aws.ToInt32(u.InputTokens)),
 						TokensOut: int(aws.ToInt32(u.OutputTokens)),
+						Model:     c.modelID,
 					}:
 					case <-ctx.Done():
 						return
