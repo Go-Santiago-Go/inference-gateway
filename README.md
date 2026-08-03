@@ -30,7 +30,7 @@ Every one of those concerns fires on a single request:
 |---|---|
 | [Demo](#demo) | A scripted run against live Bedrock: streaming, multi-turn context, and a real `429` |
 | [The problem](#the-problem) | What a raw Bedrock endpoint does not give you, and what the layer in front has to get right |
-| [How it works](#how-it-works) | The middleware chain, the one interface every backend sits behind, and where failover stops |
+| [How it works](#how-it-works) | The middleware chain, the one interface every backend sits behind, where failover stops, and the deployed shape on AWS |
 | [Quickstart](#quickstart) | Clone to streaming tokens, then the whole stack including Grafana |
 | [Trade-offs](#trade-offs) | Every design decision, what it was chosen over, and why |
 | [Results](#results) | Benchmarked overhead, throughput, and image size, and what is verified on AWS |
@@ -116,6 +116,38 @@ and the retry loop instead of paying for tokens nobody reads.
 
 A React and TypeScript client (`client/`) streams from the gateway in a browser, so each of these
 features is visible on screen rather than only in a log line.
+
+Deployed, that pipeline is one Fargate task behind a load balancer, with the client served separately
+as a static bundle:
+
+```mermaid
+flowchart LR
+    user(["Browser"])
+
+    subgraph edge["Static app"]
+        cf["CloudFront<br/>TLS · OAC"] --> s3[("S3 · private")]
+    end
+
+    subgraph vpc["VPC · public subnets"]
+        alb["Load Balancer<br/>TLS"] --> task["ECS Fargate task<br/>:8080 · single task"]
+    end
+
+    user -->|"load the app"| cf
+    user -->|"POST /v1/chat"| alb
+    task -.->|"ConverseStream"| bedrock["Bedrock"]
+    task -.->|"image at launch"| ecr[("ECR")]
+    task -.->|"API keys at startup"| ssm["SSM Parameter Store"]
+    task -.->|"structured logs"| cw["CloudWatch Logs"]
+```
+
+Solid edges are what a browser does, load the app from CloudFront and then call the API through the
+load balancer; dashed are the task's own outbound calls. Two details in that picture are consequences
+of decisions above rather than incidental. The browser talks to **two origins**, CloudFront for the
+app and the load balancer for the API, which is why Terraform wires the gateway's CORS allowlist to
+the distribution's domain at apply time. And it is a **single task** on purpose: the token buckets
+live in that task's memory, so scaling out would split each key's budget across tasks and the limit
+would stop meaning what it says. Both Terraform stacks, the deploy walkthrough, teardown, and the
+three constraints Express Mode imposes are in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## Quickstart
 
